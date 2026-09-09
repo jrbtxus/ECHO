@@ -1,8 +1,8 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'motion/react';
 import { createPortal } from 'react-dom';
 import { Cable, Captions, CircleAlert, Download, FileDown, Loader2, Monitor, X } from 'lucide-react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { audioExportFormats, type AudioExportFormat, type AudioOutputMode, type AudioStatus } from '../../../shared/types/audio';
 import { isReliableBpmAnalysis } from '../../../shared/constants/audioAnalysis';
 import type { AirPlayReceiverStatus, ConnectMetadata, ConnectReceiverStatus, ConnectSessionStatus } from '../../../shared/types/connect';
@@ -836,6 +836,14 @@ export const PlayerBar = ({
   });
   const dsdAutoVolumeLockRestoreRef = useRef<number | null>(null);
   const dsdAutoVolumeLockRequestRef = useRef(0);
+  const coverSwipeRef = useRef<{
+    pointerId: number | null;
+    startX: number;
+    startY: number;
+    active: boolean;
+    horizontal: boolean;
+  } | null>(null);
+  const coverClickSuppressRef = useRef(false);
 
   const shouldIgnoreAudioStatus = useCallback((nextAudioStatus: AudioStatus): boolean => {
     const lastAction = lastPlaybackActionStatusRef.current;
@@ -2660,6 +2668,73 @@ export const PlayerBar = ({
     void runPlaybackAction(queue.playNext);
   }, [queue.playNext, runPlaybackAction]);
 
+  const handleCoverPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    coverSwipeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: true,
+      horizontal: false,
+    };
+    coverClickSuppressRef.current = false;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, []);
+
+  const handleCoverPointerMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const swipe = coverSwipeRef.current;
+    if (!swipe || !swipe.active || swipe.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - swipe.startX;
+    const deltaY = event.clientY - swipe.startY;
+    if (swipe.horizontal || Math.abs(deltaX) > Math.abs(deltaY)) {
+      swipe.horizontal = true;
+    }
+  }, []);
+
+  const handleCoverPointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>): void => {
+      const swipe = coverSwipeRef.current;
+      if (!swipe || swipe.pointerId !== event.pointerId) {
+        return;
+      }
+
+      coverSwipeRef.current = null;
+      if (!swipe.horizontal) {
+        return;
+      }
+
+      const deltaX = event.clientX - swipe.startX;
+      const threshold = 48;
+      if (deltaX <= -threshold) {
+        if (queue.canGoNext) {
+          handleNext();
+          coverClickSuppressRef.current = true;
+        }
+        return;
+      }
+
+      if (deltaX >= threshold) {
+        if (queue.canGoPrevious) {
+          handlePrevious();
+          coverClickSuppressRef.current = true;
+        }
+      }
+    },
+    [handleNext, handlePrevious, queue.canGoNext, queue.canGoPrevious],
+  );
+
+  const handleCoverPointerCancel = useCallback((event: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (coverSwipeRef.current?.pointerId === event.pointerId) {
+      coverSwipeRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     applyMediaSessionSnapshot({
       enabled: smtcEnabled && Boolean(filePath || currentTrack),
@@ -2702,6 +2777,15 @@ export const PlayerBar = ({
     rememberLyricsViewMode('lyrics');
     window.dispatchEvent(new CustomEvent('app:navigate:lyrics', { detail: { mode: 'lyrics' } }));
   }, []);
+
+  const handleCoverClick = useCallback((): void => {
+    if (coverClickSuppressRef.current) {
+      coverClickSuppressRef.current = false;
+      return;
+    }
+
+    handleOpenLyrics();
+  }, [handleOpenLyrics]);
 
   const handleOpenMv = useCallback((): void => {
     rememberLyricsViewMode('mv');
@@ -2952,7 +3036,11 @@ export const PlayerBar = ({
           data-loading={isPlaybackPreparing ? 'true' : undefined}
           layoutId={playerCoverLayoutId(trackId)}
           transition={springSoft}
-          onClick={handleOpenLyrics}
+          onClick={handleCoverClick}
+          onPointerDown={handleCoverPointerDown}
+          onPointerMove={handleCoverPointerMove}
+          onPointerUp={handleCoverPointerUp}
+          onPointerCancel={handleCoverPointerCancel}
         >
           {artworkUrl ? (
             <img alt="" src={artworkUrl} />
