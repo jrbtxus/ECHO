@@ -15,10 +15,12 @@ import Database from 'better-sqlite3';
 import {
   checkDatabaseHealth,
   checkpointWal,
+  isSqliteCorruptionMessage,
   type DatabaseHealthResult,
 } from '../database/health';
 import { markStartupStage } from '../diagnostics/StartupDiagnostics';
 import { beginMainBackgroundTask } from '../diagnostics/PlaybackPerformanceDiagnostics';
+import { getPortableDataPath } from './scoopService';
 import type {
   LibraryDatabaseArchiveInfo,
   LibraryDatabaseDeleteResult,
@@ -175,13 +177,11 @@ export type DataProtectionResult = {
 
 export class LibraryDatabaseUnavailableError extends Error {
   constructor(readonly recovery: LibraryRecoveryResult | null = lastDataProtectionResult?.recovery ?? null) {
+    const confirmedCorruption = recovery?.health.status === 'corrupt';
     super(
-      recovery?.action === 'protected' ||
-        recovery?.action === 'archivedOnly' ||
-        recovery?.action === 'quarantined' ||
-        recovery?.action === 'failed'
-        ? '音乐库数据库未通过健康检查，ECHO Next 已进入保护模式。音乐文件不会被删除，请前往设置里的数据库恢复工具处理。'
-        : '音乐库数据库暂时不可用。请稍后重试或前往设置里的数据库恢复工具处理。',
+      confirmedCorruption
+        ? 'SQLite 明确报告音乐库数据库损坏，ECHO Next 已进入保护模式。音乐文件不会被删除，请前往设置里的数据库恢复工具处理。'
+        : '音乐库数据库暂时无法读取，健康检查未完成；这不代表数据库已经损坏。请重启 ECHO Next，若仍然出现请检查运行环境。',
     );
     this.name = 'LibraryDatabaseUnavailableError';
   }
@@ -441,10 +441,24 @@ export const getLibraryDatabaseMaintenanceReport = (userDataPath = app.getPath('
   events: readLibraryDatabaseMaintenanceEvents(userDataPath),
 });
 
+const getExecutablePath = (electronApp: ElectronAppLike): string | undefined => {
+  try {
+    return typeof electronApp.getPath === 'function' ? electronApp.getPath('exe') : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 export const getProtectedUserDataPath = (electronApp: ElectronAppLike = app): string => {
   const overridePath = process.env.ECHO_USER_DATA_PATH_OVERRIDE?.trim();
   if (overridePath) {
     return resolve(overridePath);
+  }
+
+  const execPath = getExecutablePath(electronApp);
+  const portableDataPath = getPortableDataPath(execPath);
+  if (portableDataPath) {
+    return portableDataPath;
   }
 
   const appDataPath = electronApp.getPath('appData');
@@ -467,7 +481,8 @@ const getSnapshotsPath = (userDataPath: string): string => join(getDataProtectio
 const getScanGuardsPath = (userDataPath: string): string => join(getDataProtectionPath(userDataPath), scanGuardDirectoryName);
 const getCorruptArchivesPath = (userDataPath: string): string => join(getDataProtectionPath(userDataPath), corruptArchivesDirectoryName);
 const getLegacyUserDataPaths = (electronApp: ElectronAppLike = app): string[] => {
-  if (process.env.ECHO_SKIP_LEGACY_USER_DATA_MIGRATION === '1') {
+  const execPath = getExecutablePath(electronApp);
+  if (process.env.ECHO_SKIP_LEGACY_USER_DATA_MIGRATION === '1' || getPortableDataPath(execPath)) {
     return [];
   }
 
@@ -586,11 +601,12 @@ const checkLibraryFastStartupHealth = (userDataPath: string): DatabaseHealthResu
       message: 'fast startup deferred full data protection',
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     return {
-      status: 'unreadable',
+      status: isSqliteCorruptionMessage(message) ? 'corrupt' : 'unreadable',
       databasePath,
       checkedAt,
-      message: error instanceof Error ? error.message : String(error),
+      message,
     };
   } finally {
     try {
@@ -598,12 +614,6 @@ const checkLibraryFastStartupHealth = (userDataPath: string): DatabaseHealthResu
     } catch {
       // Ignore close errors while reporting the lightweight startup result.
     }
-  }
-};
-
-const pruneOldSnapshots = (userDataPath: string): void => {
-  for (const snapshotPath of listSnapshotPaths(userDataPath).slice(maxSnapshots)) {
-    rmSync(snapshotPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 };
 
@@ -723,6 +733,7 @@ const removeLibraryTriplet = (rootPath: string): void => {
 const maxProtectedDisplayTextLength = 512;
 const maxProtectedSearchTextLength = 4096;
 const maxProtectedDiagnosticTextLength = 128 * 1024;
+// eslint-disable-next-line no-control-regex -- NUL is an intentional poison-data marker.
 const poisonBinaryMarkerPattern = /(?:APIC|image\/(?:jpeg|jpg|png|webp|gif)|JFIF|Exif|\u0000)/iu;
 const textFieldsToInspect: Array<{ table: string; column: string; maxLength: number; blocksStartup?: boolean }> = [
   { table: 'tracks', column: 'title', maxLength: maxProtectedDisplayTextLength },
@@ -896,6 +907,7 @@ export const inspectLibraryDatabaseForPoison = (databasePath: string): LibraryDa
 };
 
 const normalizeProtectedTextWhitespace = (text: string): string =>
+  // eslint-disable-next-line no-control-regex -- sanitization intentionally targets control characters.
   text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, ' ').replace(/\s+/gu, ' ').trim();
 
 const countProtectedControlCharacters = (text: string): number => {
@@ -2709,7 +2721,18 @@ export const getLastDataProtectionResult = (): DataProtectionResult | null => la
 
 export const createDataProtectionDisabledResult = (userDataPath = app.getPath('userData')): DataProtectionResult => {
   const libraryHealth = checkLibraryFastStartupHealth(userDataPath);
-  const recovery: LibraryRecoveryResult = { action: 'none', health: libraryHealth };
+  let recoveryAction: LibraryRecoveryResult['action'] = 'none';
+
+  if (libraryHealth.status === 'corrupt') {
+    recoveryAction = 'protected';
+  } else if (libraryHealth.status === 'unreadable') {
+    recoveryAction = 'failed';
+  }
+
+  const recovery: LibraryRecoveryResult = {
+    action: recoveryAction,
+    health: libraryHealth,
+  };
 
   lastDataProtectionResult = {
     userDataPath,
@@ -2727,6 +2750,7 @@ export const isProtectedLibraryAvailable = (): boolean =>
   !lastDataProtectionResult ||
   (
     lastDataProtectionResult.libraryHealth.status !== 'corrupt' &&
+    lastDataProtectionResult.recovery.action !== 'protected' &&
     lastDataProtectionResult.recovery.action !== 'quarantined' &&
     lastDataProtectionResult.recovery.action !== 'failed'
   );
@@ -2768,7 +2792,7 @@ export const ensureDataProtectionFastStartup = async (
 };
 
 export const ensureDataProtectionStartup = async (
-  reason: DataProtectionReason = 'startup',
+  _reason: DataProtectionReason = 'startup',
   explicitUserDataPath?: string,
 ): Promise<DataProtectionResult> => {
   const phaseContext: DataProtectionPhaseContext = { scope: 'startup' };

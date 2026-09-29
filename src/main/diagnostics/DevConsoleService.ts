@@ -17,6 +17,7 @@ import { getActiveLibraryScanPerfContext, isLibraryScanPerfDiagnosticsEnabled } 
 import { recordRuntimePerformanceStall } from './RuntimePerformanceDiagnostics';
 import { areDeveloperToolsAllowed } from '../app/securityPolicy';
 import { resolveAppIconPath } from '../app/appIcon';
+import { classifyCapturedConsoleLevel } from './CapturedConsoleLevel';
 
 const mainOutputDir = import.meta.dirname;
 const maxEntries = 2500;
@@ -182,13 +183,13 @@ const appendStreamChunk = (
 
   for (const line of lines) {
     if (line.trim()) {
-      pushEntry(source, level, line);
+      pushEntry(source, classifyCapturedConsoleLevel(source, level, normalizeLine(line)), line);
     }
   }
 
   if (tail.length >= maxLineLength) {
     pendingChunks.set(source, '');
-    pushEntry(source, level, tail);
+    pushEntry(source, classifyCapturedConsoleLevel(source, level, normalizeLine(tail)), tail);
   }
 };
 
@@ -377,6 +378,11 @@ const inferPerformanceStallCause = (
   const lastSlowIpcChannel = trimmedString(playbackSnapshot.lastSlowIpcChannel);
   const lastSlowIpcDurationMs = finiteNumber(playbackSnapshot.lastSlowIpcDurationMs);
   const lastSlowIpcAgeMs = finiteNumber(playbackSnapshot.lastSlowIpcAgeMs);
+  const activeIpcChannel = trimmedString(playbackSnapshot.activeIpcChannel);
+  const activeIpcElapsedMs = finiteNumber(playbackSnapshot.activeIpcElapsedMs);
+  const lastIpcChannel = trimmedString(playbackSnapshot.lastIpcChannel);
+  const lastIpcDurationMs = finiteNumber(playbackSnapshot.lastIpcDurationMs);
+  const lastIpcAgeMs = finiteNumber(playbackSnapshot.lastIpcAgeMs);
   const activePlaybackElapsedMs = finiteNumber(playbackSnapshot.elapsedMs);
   const lastPlaybackPhaseMs = finiteNumber(playbackSnapshot.lastCompletedDurationMs);
   const lastInputType = trimmedString(payload.details?.lastInputType);
@@ -407,6 +413,53 @@ const inferPerformanceStallCause = (
       confidence: 'high',
       why: `main event loop stalled while ${pendingBackgroundTask} was active`,
       actionHint: 'Move or slice this background task if it appears next to playback glitches.',
+    };
+  }
+
+  // Several handlers can complete before the delayed timer runs. The last
+  // completion may be tiny, so keep the longest nearby slow IPC as evidence.
+  const longestNearbyIpc = playbackSnapshot.breadcrumbs
+    .filter((entry) => entry.ageMs <= mainStallCheckIntervalMs)
+    .flatMap((entry) => {
+      const match = /^ipc:(.+):slow:(\d+)ms$/u.exec(entry.label);
+      return match ? [{ channel: match[1], durationMs: Number(match[2]) }] : [];
+    })
+    .sort((left, right) => right.durationMs - left.durationMs)[0];
+  if (
+    payload.source === 'main' && longestNearbyIpc &&
+    longestNearbyIpc.durationMs > (lastIpcDurationMs ?? 0) &&
+    longestNearbyIpc.durationMs >= Math.max(500, payload.thresholdMs, payload.durationMs * 0.5)
+  ) {
+    return {
+      probableCause: 'slow_ipc_handler',
+      confidence: 'medium',
+      why: `IPC "${longestNearbyIpc.channel}" recently took ${longestNearbyIpc.durationMs.toFixed(0)}ms, the longest nearby slow handler`,
+      actionHint: 'Inspect this IPC handler first; confirm synchronous work versus asynchronous waiting before attributing the stall.',
+    };
+  }
+
+  if (
+    payload.source === 'main' &&
+    lastIpcChannel &&
+    lastIpcDurationMs !== null &&
+    lastIpcAgeMs !== null &&
+    lastIpcDurationMs >= Math.max(500, payload.thresholdMs) &&
+    lastIpcAgeMs <= Math.max(2_000, payload.durationMs + mainStallCheckIntervalMs)
+  ) {
+    return {
+      probableCause: 'recent_blocking_ipc_handler',
+      confidence: 'high',
+      why: `IPC "${lastIpcChannel}" occupied ${lastIpcDurationMs.toFixed(0)}ms and overlapped this event-loop stall`,
+      actionHint: 'Inspect this IPC handler first; move synchronous work off the main thread or split it into bounded slices.',
+    };
+  }
+
+  if (payload.source === 'main' && activeIpcChannel && activeIpcElapsedMs !== null) {
+    return {
+      probableCause: 'active_ipc_handler',
+      confidence: 'medium',
+      why: `IPC "${activeIpcChannel}" was still pending after ${activeIpcElapsedMs.toFixed(0)}ms`,
+      actionHint: 'Inspect this IPC handler and confirm whether it is waiting asynchronously or doing synchronous main-thread work.',
     };
   }
 
@@ -550,6 +603,13 @@ export const recordPerformanceStall = (
   appendOptionalValueLine(lines, 'lastSlowIpcMs', playbackSnapshot.lastSlowIpcDurationMs);
   appendOptionalValueLine(lines, 'lastSlowIpcAgeMs', playbackSnapshot.lastSlowIpcAgeMs);
   appendOptionalValueLine(lines, 'lastSlowIpcFailed', playbackSnapshot.lastSlowIpcFailed);
+  appendOptionalLine(lines, 'activeIpcChannel', playbackSnapshot.activeIpcChannel);
+  appendOptionalValueLine(lines, 'activeIpcElapsedMs', playbackSnapshot.activeIpcElapsedMs);
+  appendOptionalValueLine(lines, 'activeIpcCount', playbackSnapshot.activeIpcCount);
+  appendOptionalLine(lines, 'lastIpcChannel', playbackSnapshot.lastIpcChannel);
+  appendOptionalValueLine(lines, 'lastIpcMs', playbackSnapshot.lastIpcDurationMs);
+  appendOptionalValueLine(lines, 'lastIpcAgeMs', playbackSnapshot.lastIpcAgeMs);
+  appendOptionalValueLine(lines, 'lastIpcFailed', playbackSnapshot.lastIpcFailed);
   appendOptionalLine(lines, 'lastPlaybackOperation', playbackSnapshot.lastCompletedOperation);
   appendOptionalLine(lines, 'lastPlaybackPhase', playbackSnapshot.lastCompletedPhase);
   appendOptionalValueLine(lines, 'lastPlaybackPhaseMs', playbackSnapshot.lastCompletedDurationMs);
@@ -923,8 +983,8 @@ export const createDevConsoleHtml = (): string => {
     .raw-entry pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #b8c3d3; font: 12px/1.45 Consolas, "Cascadia Mono", "JetBrains Mono", monospace; }
     .line[data-level="debug"] .level { color: #94a3b8; }
     .line[data-level="warn"] .level, .line[data-level="warning"] .level { color: var(--warn); }
-    .line[data-level="error"] .level, .line[data-source="stderr"] .level { color: var(--error); }
-    .line[data-source="stderr"] .msg { color: #fecdd3; }
+    .line[data-level="error"] .level { color: var(--error); }
+    .line[data-source="stderr"][data-level="error"] .msg { color: #fecdd3; }
     .line[data-source="renderer"] .source { color: #c4b5fd; }
     .line[data-source="system"] .source { color: #f9a8d4; }
     .details { color: #66758a; }
@@ -1314,7 +1374,7 @@ export const createDevConsoleHtml = (): string => {
     const isNearBottom = () => consoleEl.scrollTop + consoleEl.clientHeight >= consoleEl.scrollHeight - 48;
     const isProblemEntry = (entry) => entry.source === 'stderr' || entry.level === 'error' || entry.level === 'warn';
     const isPerformanceEntry = (entry) => /^\\[performance:(main|renderer)\\]/.test(entry.message);
-    const problemSeverity = (entry) => entry.level === 'error' || entry.source === 'stderr' ? 'error' : 'warn';
+    const problemSeverity = (entry) => entry.level === 'error' ? 'error' : 'warn';
     const fieldFromLines = (message, name) => {
       const prefix = name + ':';
       const line = String(message || '').split('\\n').find((item) => item.startsWith(prefix));

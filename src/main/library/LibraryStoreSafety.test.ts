@@ -58,6 +58,118 @@ afterEach(() => {
 });
 
 describe('LibraryStore track metadata safety', () => {
+  it('keeps statistics totals and the latest track and album snapshots in full and filtered views', () => {
+    const store = makeStore();
+    const addPlay = (trackId: string, title: string, startedAt: string, coverSnapshot: string) => {
+      const entry = store.createPlaybackHistoryEntry({
+        trackId, trackPath: `D:\\Music\\${trackId}.flac`, title, artist: 'Artist',
+        album: 'Shared Album', albumArtist: 'Artist', coverId: null, coverSnapshot,
+        durationSeconds: 120, startedAt,
+      });
+      store.finishPlaybackHistoryEntry(entry.id, { playedSeconds: 40, completed: true });
+    };
+    addPlay('one', 'Old title', '2026-09-01T01:00:00.000Z', 'old-cover');
+    addPlay('one', 'New title', '2026-09-02T01:00:00.000Z', 'new-cover');
+    addPlay('two', 'Another song', '2026-09-03T01:00:00.000Z', 'latest-album-cover');
+    for (const query of [undefined, { from: '2026-09-01T00:00:00.000Z' }]) {
+      const stats = store.getPlaybackStatsDashboard(query);
+      expect(stats.totals).toMatchObject({ playCount: 3, playedSeconds: 120, uniqueTracks: 2 });
+      expect(stats.topTracks[0]).toMatchObject({ trackId: 'one', title: 'New title', playCount: 2, coverThumb: 'new-cover' });
+      expect(stats.topAlbums).toHaveLength(1);
+      expect(stats.topAlbums?.[0]).toMatchObject({ title: 'Shared Album', playCount: 3, playedSeconds: 120, coverThumb: 'latest-album-cover' });
+    }
+    const recent = store.getPlaybackStatsDashboard({ from: '2026-09-02T00:00:00.000Z' });
+    expect(recent.totals.playCount).toBe(2);
+    expect(recent.topAlbums?.[0].playCount).toBe(2);
+  });
+
+  it('filters duplicate membership without changing search, totals or pagination', () => {
+    const store = makeStore();
+    const folder = store.addFolder('D:\\Music');
+    for (const [id, title] of [['keep', 'Alpha'], ['hidden', 'Beta'], ['unique', 'Gamma']]) {
+      store.upsertTrack(baseTrack(folder.id, `D:\\Music\\${id}.flac`, { id, title }));
+    }
+    const timestamp = '2026-01-01T00:00:00.000Z';
+    const group = database!.prepare(`INSERT INTO duplicate_track_groups
+      (id, mode, duplicate_key, representative_track_id, track_count, created_at, updated_at)
+      VALUES (?, ?, ?, 'keep', 2, ?, ?)`);
+    group.run('strict-group', 'strict', 'strict-key', timestamp, timestamp);
+    group.run('other-group', 'balanced', 'other-key', timestamp, timestamp);
+    const member = database!.prepare(`INSERT INTO duplicate_track_members
+      (group_id, track_id, quality_score, rank, hidden, created_at, updated_at)
+      VALUES (?, ?, 1, 1, ?, ?, ?)`);
+    member.run('strict-group', 'keep', 0, timestamp, timestamp);
+    member.run('strict-group', 'hidden', 1, timestamp, timestamp);
+    member.run('other-group', 'unique', 1, timestamp, timestamp);
+
+    expect(store.getTracks().total).toBe(3);
+    const visible = store.getTracks({ hideDuplicates: true });
+    expect(visible.total).toBe(2);
+    expect(visible.items.map((track) => track.id)).toEqual(['keep', 'unique']);
+    expect(store.getTracks({ hideDuplicates: true, search: 'Beta' }).total).toBe(0);
+    expect(store.getTracks({ showDuplicatesOnly: true, search: 'Beta' }).items.map((track) => track.id)).toEqual(['hidden']);
+    const duplicates = store.getTracks({ showDuplicatesOnly: true, hideDuplicates: true, sourceProvider: 'local' });
+    expect(duplicates.total).toBe(2);
+    expect(duplicates.items.map((track) => track.id)).toEqual(['keep', 'hidden']);
+    expect(store.getTracks({ hideDuplicates: true, pageSize: 1, page: 1 })).toMatchObject({ total: 2, hasMore: true, items: [{ id: 'keep' }] });
+    expect(store.getTracks({ hideDuplicates: true, pageSize: 1, page: 2 })).toMatchObject({ total: 2, hasMore: false, items: [{ id: 'unique' }] });
+  });
+
+  it('returns semantic scan metadata with folder cache states', () => {
+    const store = makeStore();
+    const folder = store.addFolder('D:\\Music');
+    const path = 'D:\\Music\\Semantic.flac';
+    store.upsertTrack(baseTrack(folder.id, path, {
+      trackNo: 3,
+      year: 2026,
+      bpm: 128,
+    }));
+
+    const state = store.getTrackCacheStatesByFolder(folder.id).get(path);
+
+    expect(state?.scanMetadata).toMatchObject({
+      fields: {
+        title: 'Safe Title',
+        artist: 'Safe Artist',
+        trackNo: 3,
+        year: 2026,
+        bpm: 128,
+      },
+      fieldSources: {
+        title: 'embedded',
+        codec: 'technical',
+      },
+      metadataStatus: 'ok',
+      embeddedMetadataStatus: 'present',
+      embeddedCoverStatus: 'missing',
+    });
+  });
+
+  it('returns semantic scan metadata with path-batched cache states', () => {
+    const store = makeStore();
+    const folder = store.addFolder('D:\\Music');
+    const path = 'D:\\Music\\Semantic Path.flac';
+    store.upsertTrack(baseTrack(folder.id, path, {
+      title: 'Semantic  Path',
+      album: 'Semantic　Album',
+    }));
+
+    const state = store.getTrackCacheStatesByPaths(folder.id, [path]).get(path);
+
+    expect(state?.scanMetadata).toMatchObject({
+      fields: {
+        title: 'Semantic Path',
+        album: 'Semantic Album',
+      },
+      fieldSources: {
+        title: 'filename_fallback',
+        album: 'unknown',
+      },
+      metadataStatus: 'ok',
+      embeddedMetadataStatus: 'present',
+    });
+  });
+
   it('sanitizes unsafe track text before writing and when reading stale rows', () => {
     const store = makeStore();
     const folder = store.addFolder('D:\\Music');

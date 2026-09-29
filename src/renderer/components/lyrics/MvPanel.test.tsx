@@ -44,6 +44,7 @@ const defaultMvSettings: MvSettings = {
   providerOrder: ['bilibili', 'youtube'],
   maxQuality: '1080p',
   allow60fps: true,
+  immersiveBackground: false,
 };
 
 const makeAudioClock = (
@@ -300,6 +301,58 @@ describe('MvPanel', () => {
     await waitFor(() => expect(container.querySelector('.lyrics-mv-video')?.getAttribute('src')).toBe('echo-video://mv/video-1'));
   });
 
+  it('retries the current track when the auto-apply threshold changes after an unsuccessful search', async () => {
+    const { container } = renderPanel(null, true, { ...defaultMvSettings, autoApplyThreshold: 0.85 });
+    await waitFor(() => expect(window.echo.mv.searchNetworkCandidates).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    const selected = makeVideo({ provider: 'bilibili', score: 0.65 });
+    vi.mocked(window.echo.mv.getSettings).mockResolvedValue({ ...defaultMvSettings, autoApplyThreshold: 0.3 });
+    vi.mocked(window.echo.mv.searchNetworkCandidates).mockImplementation(async () => {
+      vi.mocked(window.echo.mv.getSelected).mockResolvedValue(selected);
+      return [];
+    });
+
+    act(() => {
+      for (const autoApplyThreshold of [0.6, 0.5, 0.3]) {
+        window.dispatchEvent(new CustomEvent('settings:changed', { detail: { autoApplyThreshold } }));
+      }
+    });
+
+    await waitFor(() => expect(window.echo.mv.searchNetworkCandidates).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(container.querySelector('.lyrics-mv-video')?.getAttribute('src')).toBe(selected.mediaUrl));
+  });
+
+  it('preserves a manually selected MV when the auto-apply threshold changes', async () => {
+    const selected = makeVideo({ selectionOrigin: 'manual' });
+    const { container } = renderPanel(selected);
+    await waitFor(() => expect(container.querySelector('.lyrics-mv-video')?.getAttribute('src')).toBe(selected.mediaUrl));
+    const initialReads = vi.mocked(window.echo.mv.getSelected).mock.calls.length;
+    act(() => window.dispatchEvent(new CustomEvent('settings:changed', { detail: { autoApplyThreshold: 0.3 } })));
+    await waitFor(() => expect(window.echo.mv.getSelected).toHaveBeenCalledTimes(initialReads + 1));
+    expect(window.echo.mv.searchNetworkCandidates).not.toHaveBeenCalled();
+    expect(container.querySelector('.lyrics-mv-video')?.getAttribute('src')).toBe(selected.mediaUrl);
+  });
+
+  it('retries streaming snapshot matching when the auto-apply threshold changes', async () => {
+    const selected = makeVideo({ provider: 'bilibili', score: 0.65 });
+    const getSelected = vi.fn().mockResolvedValue(null);
+    const searchSnapshot = vi.fn().mockResolvedValue([]);
+    const getSettings = vi.fn().mockResolvedValue({ ...defaultMvSettings, autoApplyThreshold: 0.85 });
+    window.echo = { mv: { getSelected, getSettings, searchNetworkCandidatesForSnapshot: searchSnapshot,
+      resolveStreams: vi.fn(async () => ({ video: selected, variants: [] })) } } as unknown as Window['echo'];
+    const { container } = render(<MvPanel trackId="track-1" streamingTarget={{ provider: 'netease', providerTrackId: '123' }}
+      title="Test Song" artist="Test Artist" coverUrl={null} isAudioPlaying audioClock={makeAudioClock()} />);
+    await waitFor(() => expect(searchSnapshot).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    getSettings.mockResolvedValue({ ...defaultMvSettings, autoApplyThreshold: 0.3 });
+    searchSnapshot.mockImplementation(async () => { getSelected.mockResolvedValue(selected); return []; });
+
+    act(() => window.dispatchEvent(new CustomEvent('settings:changed', { detail: { autoApplyThreshold: 0.3 } })));
+
+    await waitFor(() => expect(searchSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(container.querySelector('.lyrics-mv-video')?.getAttribute('src')).toBe(selected.mediaUrl));
+  });
+
   it('searches and selects remote track MVs from snapshot metadata', async () => {
     const remoteTrack = makeRemoteTrack();
     const selectedAfterSearch = makeVideo({
@@ -313,7 +366,7 @@ describe('MvPanel', () => {
         seek: vi.fn(),
       },
       mv: {
-        getSelected: vi.fn().mockResolvedValue(null),
+        getSelected: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(selectedAfterSearch),
         getSettings: vi.fn().mockResolvedValue(defaultMvSettings),
         setSettings: vi.fn(),
         findLocalCandidates: vi.fn().mockResolvedValue([]),
@@ -367,11 +420,11 @@ describe('MvPanel', () => {
           title: 'Remote Song',
           artist: 'Remote Artist',
           mediaType: 'remote',
-          query: 'Remote Song Remote Artist',
+          autoSelect: true,
         }),
       ),
     );
-    await waitFor(() => expect(window.echo.mv.selectVideo).toHaveBeenCalledWith(remoteTrack.id, 'bilibili:BVremote'));
+    expect(window.echo.mv.selectVideo).not.toHaveBeenCalled();
     await waitFor(() => expect(container.querySelector('video')?.getAttribute('src')).toBe('echo-video://mv/remote-video-1'));
   });
 
@@ -402,7 +455,7 @@ describe('MvPanel', () => {
         seek: vi.fn(),
       },
       mv: {
-        getSelected: vi.fn().mockResolvedValue(null),
+        getSelected: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(selectedAfterSearch),
         getSettings: vi.fn().mockResolvedValue(defaultMvSettings),
         setSettings: vi.fn(),
         findLocalCandidates: vi.fn().mockResolvedValue([]),
@@ -456,7 +509,7 @@ describe('MvPanel', () => {
           title: 'New Genesis',
           artist: 'Ado',
           mediaType: 'streaming',
-          query: 'New Genesis Ado',
+          autoSelect: true,
         }),
       ),
     );
@@ -489,7 +542,7 @@ describe('MvPanel', () => {
         seek: vi.fn(),
       },
       mv: {
-        getSelected: vi.fn().mockResolvedValue(null),
+        getSelected: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(selectedAfterSearch),
         getSettings: vi.fn().mockResolvedValue(defaultMvSettings),
         setSettings: vi.fn(),
         findLocalCandidates: vi.fn().mockResolvedValue([]),
@@ -545,11 +598,11 @@ describe('MvPanel', () => {
           title: 'Air Song',
           artist: 'Air Artist',
           mediaType: 'remote',
-          query: 'Air Song Air Artist',
+          autoSelect: true,
         }),
       ),
     );
-    await waitFor(() => expect(window.echo.mv.selectVideo).toHaveBeenCalledWith(airPlayTrack.id, 'bilibili:BVairplay'));
+    expect(window.echo.mv.selectVideo).not.toHaveBeenCalled();
     await waitFor(() => expect(container.querySelector('video')?.getAttribute('src')).toBe('echo-video://mv/airplay-video-1'));
   });
 
@@ -570,7 +623,7 @@ describe('MvPanel', () => {
         seek: vi.fn(),
       },
       mv: {
-        getSelected: vi.fn().mockResolvedValue(null),
+        getSelected: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(selectedAfterSearch),
         getSettings: vi.fn().mockResolvedValue({
           ...defaultMvSettings,
           autoSearch: true,
@@ -628,13 +681,11 @@ describe('MvPanel', () => {
           title: 'Air Song',
           artist: 'Air Artist',
           mediaType: 'remote',
-          query: 'Air Song Air Artist',
+          autoSelect: true,
         }),
       ),
     );
-    await waitFor(() =>
-      expect(window.echo.mv.selectVideo).toHaveBeenCalledWith('airplay-receiver:source-1', 'bilibili:BVairplay2'),
-    );
+    expect(window.echo.mv.selectVideo).not.toHaveBeenCalled();
     await waitFor(() => expect(container.querySelector('video')?.getAttribute('src')).toBe('echo-video://mv/airplay-video-2'));
   });
 
@@ -689,21 +740,21 @@ describe('MvPanel', () => {
     );
   });
 
-  it('keeps the immersive background MV looping while foreground MV can end', async () => {
+  it('renders only one looping video while immersive MV is active', async () => {
     const { container } = renderPanel(makeVideo(), true, {
       ...defaultMvSettings,
       immersiveBackground: true,
     });
 
-    const foregroundVideo = await waitFor(() => {
-      const element = container.querySelector('.lyrics-mv-video') as HTMLVideoElement | null;
+    const backgroundVideo = await waitFor(() => {
+      const element = container.querySelector('.lyrics-mv-background-video') as HTMLVideoElement | null;
       expect(element).toBeTruthy();
       return element!;
     });
-    const backgroundVideo = container.querySelector('.lyrics-mv-background-video') as HTMLVideoElement | null;
 
-    expect(foregroundVideo.loop).toBe(false);
-    expect(backgroundVideo?.loop).toBe(true);
+    expect(backgroundVideo.loop).toBe(true);
+    expect(container.querySelector('.lyrics-mv-video')).toBeNull();
+    expect(container.querySelectorAll('video')).toHaveLength(1);
   });
 
   it('keeps foreground MV playback but removes the duplicate background video in render pressure mode', async () => {
@@ -796,7 +847,7 @@ describe('MvPanel', () => {
         }),
       },
       mv: {
-        getSelected: vi.fn().mockResolvedValue(null),
+        getSelected: vi.fn().mockResolvedValueOnce(null).mockResolvedValue(selectedAfterSearch),
         getSettings: vi.fn().mockResolvedValue(defaultMvSettings),
         setSettings: vi.fn(),
         findLocalCandidates: vi.fn().mockResolvedValue([]),
@@ -849,11 +900,11 @@ describe('MvPanel', () => {
           trackId: 'streaming:qqmusic:song-mid',
           title: 'Provider Exact MV',
           artist: 'Provider Artist',
-          query: 'Provider Exact MV Provider Artist',
+          autoSelect: true,
         }),
       ),
     );
-    await waitFor(() => expect(window.echo.mv.selectVideo).toHaveBeenCalledWith('streaming:qqmusic:song-mid', 'bilibili:BVstreaming'));
+    expect(window.echo.mv.selectVideo).not.toHaveBeenCalled();
     await waitFor(() => expect(container.querySelector('video')?.getAttribute('src')).toBe('echo-video://mv/video-1'));
   });
 
@@ -948,7 +999,7 @@ describe('MvPanel', () => {
       },
       mv: {
         getSelected: vi.fn().mockResolvedValue(null),
-        getSettings: vi.fn().mockResolvedValue(defaultMvSettings),
+        getSettings: vi.fn().mockResolvedValue({ ...defaultMvSettings, immersiveBackground: true }),
         setSettings: vi.fn(),
         findLocalCandidates: vi.fn().mockResolvedValue([]),
         searchNetworkCandidates: vi.fn().mockResolvedValue([]),
@@ -986,7 +1037,7 @@ describe('MvPanel', () => {
     expect(window.echo.streaming.getMv).not.toHaveBeenCalled();
     expect(window.echo.mv.searchNetworkCandidatesForSnapshot).not.toHaveBeenCalled();
     const frame = await waitFor(() => {
-      const element = container.querySelector('iframe.lyrics-mv-video--youtube') as HTMLIFrameElement | null;
+      const element = container.querySelector('iframe.lyrics-mv-background-video--youtube') as HTMLIFrameElement | null;
       expect(element?.getAttribute('src')).toContain('https://www.youtube.com/embed/abc123DEF45');
       return element!;
     });
@@ -996,14 +1047,11 @@ describe('MvPanel', () => {
     expect(frame.getAttribute('src')).toContain('disablekb=1');
     expect(frame.getAttribute('src')).toContain('fs=0');
     expect(frame.getAttribute('referrerpolicy')).toBe('strict-origin-when-cross-origin');
+    expect(frame.getAttribute('src')).toContain('loop=1');
+    expect(frame.getAttribute('src')).toContain('playlist=abc123DEF45');
     expect(container.querySelector('.lyrics-mv-panel')?.getAttribute('data-immersive-active')).toBe('true');
-
-    const backgroundFrame = container.querySelector('iframe.lyrics-mv-background-video--youtube') as HTMLIFrameElement | null;
-    expect(backgroundFrame?.getAttribute('src')).toContain('https://www.youtube.com/embed/abc123DEF45');
-    expect(backgroundFrame?.getAttribute('src')).toContain('controls=0');
-    expect(backgroundFrame?.getAttribute('src')).toContain('loop=1');
-    expect(backgroundFrame?.getAttribute('src')).toContain('playlist=abc123DEF45');
-    expect(backgroundFrame?.getAttribute('referrerpolicy')).toBe('strict-origin-when-cross-origin');
+    expect(container.querySelector('iframe.lyrics-mv-video--youtube')).toBeNull();
+    expect(container.querySelectorAll('iframe')).toHaveLength(1);
   });
 
   it('keeps the foreground YouTube iframe but removes the duplicate background iframe in render pressure mode', async () => {
@@ -1651,7 +1699,12 @@ describe('MvPanel', () => {
 
   it('wraps the target time for shorter looping MV videos', async () => {
     vi.spyOn(performance, 'now').mockReturnValue(0);
-    const { container } = renderPanel(makeVideo(), true, { ...defaultMvSettings, restartAudioOnLoad: true }, 125);
+    const { container } = renderPanel(
+      makeVideo(),
+      true,
+      { ...defaultMvSettings, restartAudioOnLoad: true, immersiveBackground: true },
+      125,
+    );
     const video = await waitFor(() => {
       const element = container.querySelector('video') as HTMLVideoElement | null;
       expect(element).toBeTruthy();
@@ -1667,7 +1720,12 @@ describe('MvPanel', () => {
   it('uses loop-aware drift around MV loop boundaries', async () => {
     vi.spyOn(performance, 'now').mockReturnValue(0);
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1000);
-    const { container, rerender } = renderPanel(makeVideo(), true, { ...defaultMvSettings, restartAudioOnLoad: true }, 29.7);
+    const { container, rerender } = renderPanel(
+      makeVideo(),
+      true,
+      { ...defaultMvSettings, restartAudioOnLoad: true, immersiveBackground: true },
+      29.7,
+    );
     const video = await waitFor(() => {
       const element = container.querySelector('video') as HTMLVideoElement | null;
       expect(element).toBeTruthy();
@@ -1787,7 +1845,6 @@ describe('MvPanel', () => {
         title: 'Test Song',
         artist: 'Test Artist',
         mediaType: 'local',
-        query: 'Test Song Test Artist',
       }),
     );
     expect(window.echo.mv.selectVideo).not.toHaveBeenCalled();

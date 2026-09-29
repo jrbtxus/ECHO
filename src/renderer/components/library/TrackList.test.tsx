@@ -4,15 +4,19 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { TrackList } from './TrackList';
 import type { LibraryTrack } from '../../../shared/types/library';
 
-vi.mock('../../i18n/I18nProvider', () => ({
-  useI18n: () => ({
-    t: (key: string) =>
-      ({
-        'songs.trackList.aria': '歌曲列表',
-        'songs.trackList.empty': '没有可显示的歌曲。导入音乐文件夹后，这里会显示曲库列表。',
-      }[key] ?? key),
-  }),
-}));
+vi.mock('../../i18n/I18nProvider', () => {
+  const t = (key: string) =>
+    ({
+      'songs.trackList.aria': '歌曲列表',
+      'songs.trackList.empty': '没有可显示的歌曲。导入音乐文件夹后，这里会显示曲库列表。',
+    })[key] ?? key;
+
+  return {
+    useI18n: () => ({ t }),
+    useOptionalI18n: () => ({ t }),
+    translateFallback: t,
+  };
+});
 
 const track = (index: number): LibraryTrack => ({
   id: `track-${index}`,
@@ -43,6 +47,38 @@ afterEach(() => {
 });
 
 describe('TrackList', () => {
+  it('can locate a known current track after its page has been replaced', () => {
+    const onViewportNeeded = vi.fn();
+    render(<TrackList currentTrackId="track-1" currentTrackIndex={0} tracks={[track(10001)]}
+      loadedStartIndex={10000} totalCount={18709} onViewportNeeded={onViewportNeeded} />);
+    onViewportNeeded.mockClear();
+    window.dispatchEvent(new Event('app:locate-current-track'));
+    expect(onViewportNeeded).toHaveBeenCalledWith({ firstIndex: 0, lastIndex: 0 });
+  });
+  it('reports the actual distant viewport without asking for sequential next pages', () => {
+    const onViewportNeeded = vi.fn();
+    const onEndReached = vi.fn();
+    render(<TrackList currentTrackId={null} tracks={[track(1)]} totalCount={18709}
+      canLoadMore onEndReached={onEndReached} onViewportNeeded={onViewportNeeded} />);
+    const list = screen.getByRole('list');
+    Object.defineProperty(list, 'clientHeight', { value: 760 });
+    onViewportNeeded.mockClear();
+    onEndReached.mockClear();
+    list.scrollTop = 760000;
+    fireEvent.scroll(list);
+    expect(onViewportNeeded).toHaveBeenCalledWith({ firstIndex: 10000, lastIndex: 10009 });
+    expect(onEndReached).not.toHaveBeenCalled();
+  });
+
+  it('keeps forwarding the latest scroll position while a page is loading', () => {
+    const onViewportNeeded = vi.fn();
+    render(<TrackList currentTrackId={null} tracks={[track(1)]} totalCount={18709}
+      isLoadingMore onViewportNeeded={onViewportNeeded} />);
+    const list = screen.getByRole('list');
+    list.scrollTop = 76000;
+    fireEvent.scroll(list);
+    expect(onViewportNeeded).toHaveBeenLastCalledWith({ firstIndex: 1000, lastIndex: 1000 });
+  });
   it('renders the polished empty list without a table header', () => {
     render(<TrackList currentTrackId={null} tracks={[]} />);
 
@@ -50,6 +86,13 @@ describe('TrackList', () => {
     expect(screen.getByText(/没有可显示的歌曲/)).toBeTruthy();
     expect(screen.queryByText('专辑艺术家')).toBeNull();
     expect(screen.queryByText('发行年份')).toBeNull();
+  });
+
+  it('uses compact virtual rows when requested', () => {
+    render(<TrackList currentTrackId={null} density="compact" tracks={[track(1)]} />);
+
+    expect(screen.getByRole('list').getAttribute('data-estimated-row-height')).toBe('60');
+    expect(screen.getByRole('list').closest('.track-list-shell')?.getAttribute('data-density')).toBe('compact');
   });
 
   it('keeps virtualization enabled for large track sets', () => {

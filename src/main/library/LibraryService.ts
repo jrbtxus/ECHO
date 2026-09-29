@@ -38,6 +38,7 @@ import {
 import { AlbumService } from './AlbumService';
 import type { AlbumMergeStrategy } from './AlbumService';
 import { getDefaultCoverCacheDir, migrateCoverCache, resolveConfiguredCoverCacheDir, resolveCoverCacheDir } from './CoverCacheManager';
+import { coverCacheOwnershipMarkerName, isCoverCacheDirectorySafeToClear } from './CoverCacheOwnership';
 import { LibraryStore } from './LibraryStore';
 import { LibraryMoveCandidateService } from './LibraryMoveCandidateService';
 import { LibraryMoveRepairService } from './LibraryMoveRepairService';
@@ -60,7 +61,9 @@ import { BpmAnalysisJobQueue } from './audioAnalysis/BpmAnalysisJobQueue';
 import { ReplayGainAnalysisJobQueue } from './audioAnalysis/ReplayGainAnalysisJobQueue';
 import { LyricsBackfillJobPersistence, LyricsBackfillJobQueue } from './LyricsBackfillJobQueue';
 import { ArtistImageCacheService } from './artistImages/ArtistImageCacheService';
+import { AlbumArtistReadModel, isAlbumArtistId } from './artist/AlbumArtistReadModel';
 import { fetchWithNetworkProxy } from '../network/networkFetch';
+import { readResponseBodyLimited, ResponseBodyTooLargeError } from '../network/readResponseBodyLimited';
 import type { ArtistImageLookupInput, ArtistImageProvider } from './artistImages/ArtistImageTypes';
 import type { MetadataService } from './MetadataService';
 import type {
@@ -113,6 +116,8 @@ import type {
   PlaybackHistorySummary,
   PlaybackMemoryGraph,
   PlaybackStatsDashboard,
+  ContinuousPlayRecommendationRequest,
+  ContinuousPlayRecommendationResult,
   StartPlaybackHistoryRequest,
   StartPlaybackHistoryResult,
   FinishPlaybackHistoryRequest,
@@ -157,18 +162,24 @@ import type {
   AlbumOnlineInfoRequestOptions,
 } from '../../shared/types/library';
 import type { AppSettings } from '../../shared/types/appSettings';
+import { resolveEffectivePerformancePolicy } from '../../shared/utils/performancePolicy';
 import type { CoverCacheMigrationResult } from '../../shared/types/coverCache';
 import type { ScanConcurrencyRecommendation } from './ScanConcurrency';
 import type { CoverExtractor } from './workers/CoverExtractor';
 import type { FileScanner } from './workers/FileScanner';
 import type { MetadataReader } from './workers/MetadataReader';
 import { getNativeFileScannerDiagnostics, NativeThenTsFileScanner } from './workers/NativeFileScanner';
-import { getNativeMetadataReaderDiagnostics, NativeThenTsMetadataReader } from './workers/NativeMetadataReader';
+import {
+  getNativeMetadataReaderDiagnostics,
+  NativeMetadataReaderPool,
+  NativeThenTsMetadataReader,
+} from './workers/NativeMetadataReader';
 import { TsCoverExtractor } from './workers/TsCoverExtractor';
 import { TsFileScanner } from './workers/TsFileScanner';
 import { TsMetadataReader } from './workers/TsMetadataReader';
 import { repairAlacTechnicalMetadataBeforeWrite } from './AlacMetadataRepair';
 import { createWorkerBackedLibraryScanWorkers } from './workers/WorkerBackedLibraryScan';
+import { LibraryReadWorker } from './workers/LibraryReadWorker';
 import { getRemoteSourceService } from './remote/RemoteSourceService';
 import { writeEmbeddedTrackTags } from './TagWriter';
 import { writeOsuFolderEmbeddedTags } from './OsuFolderImport';
@@ -232,6 +243,7 @@ const hasAlbumIndexAppliedField = (result: NetworkApplyResult): boolean =>
   Object.keys(result.appliedFields).some((key) => albumIndexAppliedFieldKeys.has(key as keyof NetworkApplyResult['appliedFields']));
 
 const playbackSafeReadCacheLimit = 40;
+const playbackSafeReadCachePressureLimit = 4;
 
 const playbackSafeCacheKey = (value: unknown): string => {
   try {
@@ -279,16 +291,6 @@ const emptyLibrarySummary = (): LibrarySummary => ({
   folderCount: 0,
   totalDuration: 0,
   lastScanAt: null,
-});
-
-const emptyPlaybackHistorySummary = (): PlaybackHistorySummary => ({
-  todayCount: 0,
-  todayPlayedSeconds: 0,
-  totalCount: 0,
-  latestPlayedAt: null,
-  rangeCount: 0,
-  rangePlayedSeconds: 0,
-  rangeLatestPlayedAt: null,
 });
 
 const emptyPlaybackStatsDashboard = (): PlaybackStatsDashboard => ({
@@ -367,6 +369,7 @@ type LibraryServiceDependencies = {
   closeDatabaseUsersBeforeRecovery?: () => void | Promise<void>;
   runExclusiveDatabaseMaintenance?: <T>(reason: string, action: () => T | Promise<T>) => Promise<T>;
   checkpointDatabase?: (reason: string) => void;
+  automaticBpmBackfill?: boolean;
 };
 
 type EmbeddedTagWriteRequest = {
@@ -379,6 +382,8 @@ type EmbeddedTagWriteRequest = {
 
 const embeddedTagWriteRetryDelayMs = 5000;
 const embeddedTagWriteMaxAttempts = 6;
+const bpmBackgroundBackfillBatchSize = 10;
+const bpmBackgroundBackfillStartupDelayMs = 5000;
 
 const broadcastLibraryChanged = (): void => {
   const startedAtMs = performance.now();
@@ -400,23 +405,6 @@ const broadcastLibraryChanged = (): void => {
 
 const romanizedSearchPattern = /[a-z]{2,}/iu;
 const playbackHistoryRefreshConcurrency = 16;
-
-const createEmptyPlaybackStatsDashboard = (): PlaybackStatsDashboard => ({
-  generatedAt: new Date().toISOString(),
-  totals: {
-    playCount: 0,
-    completedCount: 0,
-    playedSeconds: 0,
-    uniqueTracks: 0,
-    uniqueArtists: 0,
-  },
-  topTracks: [],
-  topArtists: [],
-  topAlbums: [],
-  formatBreakdown: [],
-  qualityBreakdown: [],
-  dailyActivity: [],
-});
 
 const getLibraryPerformanceDiagnostics = (): LibraryDiagnostics['performance'] => {
   const playbackPerformance = getPlaybackPerformanceSnapshot();
@@ -456,6 +444,7 @@ const isExistingFile = async (filePath: string): Promise<boolean> => {
 };
 
 export class LibraryService {
+  private readWorker: LibraryReadWorker | null = null;
   private artistsDirty = false;
   private groupingRefreshTimer: NodeJS.Timeout | null = null;
   private groupingRefreshQueued = false;
@@ -474,8 +463,6 @@ export class LibraryService {
   private readonly playbackSafeAlbumForTrackCache = new Map<string, LibraryAlbum | null>();
   private readonly playbackSafeArtistsCache = new Map<string, LibraryPage<LibraryArtist>>();
   private readonly playbackSafeArtistAlbumsCache = new Map<string, LibraryPage<LibraryAlbum>>();
-  private readonly playbackSafePlaybackHistoryCache = new Map<string, LibraryPage<PlaybackHistoryEntry>>();
-  private readonly playbackSafePlaybackHistorySummaryCache = new Map<string, PlaybackHistorySummary>();
   private playbackSafeSummaryCache: LibrarySummary | null = null;
   private readonly playbackStatsDashboardCache = new Map<string, PlaybackStatsDashboard>();
   private readonly playbackMemoryGraphCache = new Map<string, PlaybackMemoryGraph>();
@@ -493,6 +480,7 @@ export class LibraryService {
   private lastMetadataBackfillCount = 0;
   private lastSkippedByCacheCount = 0;
   private searchIndexBackfillTimer: NodeJS.Timeout | null = null;
+  private bpmBackfillTimer: NodeJS.Timeout | null = null;
   private searchIndexBackfillRunning = false;
   private searchIndexBackfillAllowDuringPlayback = false;
   private artistImagePlaybackStatusUnsubscribe: (() => void) | null = null;
@@ -500,6 +488,7 @@ export class LibraryService {
   private readonly lyricsBackfillJobQueue: LyricsBackfillJobQueue;
   private coverCacheSizeSnapshot: DiagnosticSizeSnapshot | null = null;
   private readonly unregisterSoftMemoryCleanup: () => void;
+  private readonly albumArtistReadModel: AlbumArtistReadModel;
   private closed = false;
 
   constructor(
@@ -523,7 +512,11 @@ export class LibraryService {
     private readonly artistEventsService: ArtistEventsService | null = null,
     private readonly closeWorkerResources: () => void = () => undefined,
     private readonly embeddedTrackTagWriter: typeof writeEmbeddedTrackTags = writeEmbeddedTrackTags,
+    private readonly automaticBpmBackfillEnabled = false,
   ) {
+    this.albumArtistReadModel = new AlbumArtistReadModel(this.database, () => ({
+      artistMergeStrategy: this.readAppSettings().artistMergeStrategy,
+    }));
     this.moveCandidateService = new LibraryMoveCandidateService(this.database);
     this.moveRepairService = new LibraryMoveRepairService(this.database, this.moveCandidateService);
     this.lyricsBackfillJobQueue = new LyricsBackfillJobQueue((query) => this.store.getTracks(query), {
@@ -537,6 +530,7 @@ export class LibraryService {
     }, 0);
     this.artistImageStartupTimer.unref?.();
     this.scheduleSearchIndexBackfill();
+    this.scheduleBpmBackfill(bpmBackgroundBackfillStartupDelayMs);
     this.networkMetadataService?.setAppliedHandler((trackId, result) => {
       this.reindexAlbumForAppliedMetadata(trackId, result);
     });
@@ -564,12 +558,10 @@ export class LibraryService {
       this.playbackSafeAlbumForTrackCache,
       this.playbackSafeArtistsCache,
       this.playbackSafeArtistAlbumsCache,
-      this.playbackSafePlaybackHistoryCache,
-      this.playbackSafePlaybackHistorySummaryCache,
       this.playbackStatsDashboardCache,
       this.playbackMemoryGraphCache,
     ];
-    const stats = caches.map((cache) => trimMapToLimit(cache, playbackSafeReadCacheLimit));
+    const stats = caches.map((cache) => trimMapToLimit(cache, playbackSafeReadCachePressureLimit));
 
     return {
       task: 'library-playback-safe-caches',
@@ -578,7 +570,7 @@ export class LibraryService {
       removedEntries: stats.reduce((total, item) => total + item.removedEntries, 0),
       details: {
         cacheCount: caches.length,
-        maxEntriesPerCache: playbackSafeReadCacheLimit,
+        maxEntriesPerCache: playbackSafeReadCachePressureLimit,
       },
     };
   }
@@ -639,6 +631,7 @@ export class LibraryService {
       }
       : options;
     const job = this.scanJobQueue.scanFolder(folder, scanOptions);
+    void this.scanJobQueue.waitForIdle(job.id).then(() => this.scheduleBpmBackfill()).catch(() => undefined);
     if (this.readAppSettings().replayGainAnalyzeMissingOnScan === true) {
       void this.scanJobQueue.waitForIdle(job.id).then(() => {
         if (this.readAppSettings().replayGainAnalyzeMissingOnScan === true) {
@@ -671,6 +664,7 @@ export class LibraryService {
       osuImport: true,
       reduceScanPressure: true,
     });
+    void this.scanJobQueue.waitForIdle(scan.id).then(() => this.scheduleBpmBackfill()).catch(() => undefined);
 
     return {
       folder,
@@ -689,7 +683,6 @@ export class LibraryService {
     return this.scanJobQueue.scanFolder(folder, {
       changesOnly: true,
       ...(folder.importProfile === 'osu' ? { audioExtensions: ['.mp3'], osuImport: true } : {}),
-      reduceScanPressure: true,
     });
   }
 
@@ -719,7 +712,6 @@ export class LibraryService {
     for (const folder of folders) {
       statuses.push(this.scanJobQueue.scanStoredTracks(folder, {
         mode,
-        reduceScanPressure: true,
         storedTrackPath: options.path,
         storedTrackRecursive: options.recursive !== false,
       }));
@@ -740,6 +732,19 @@ export class LibraryService {
   getTracks(query?: LibraryPageQuery): LibraryPage<LibraryTrack> {
     this.maybeScheduleRomanizedSearchBackfill(query?.search);
     return this.store.getTracks(query);
+  }
+
+  getTracksAsync(query?: LibraryPageQuery): Promise<LibraryPage<LibraryTrack>> {
+    if (this.closed) return Promise.reject(new Error('Library service is closed'));
+    this.maybeScheduleRomanizedSearchBackfill(query?.search);
+    if (this.databasePath === ':memory:') return Promise.resolve(this.store.getTracks(query));
+    const settings = this.readAppSettings();
+    this.readWorker ??= new LibraryReadWorker(this.databasePath);
+    return this.readWorker.read('tracks', query, {
+      chineseCrossScriptSearchEnabled: settings.chineseCrossScriptSearchEnabled !== false,
+      artistMergeStrategy: settings.artistMergeStrategy ?? 'standard',
+      remoteAlbumMergeStrategy: settings.remoteAlbumMergeStrategy ?? 'conservative',
+    });
   }
 
   getTracksPlaybackSafe(query?: LibraryPageQuery): Promise<LibraryPage<LibraryTrack>> {
@@ -992,6 +997,18 @@ export class LibraryService {
     return this.store.getAlbums(query);
   }
 
+  getAlbumsAsync(query?: LibraryPageQuery): Promise<LibraryPage<LibraryAlbum>> {
+    if (this.closed) return Promise.reject(new Error('Library service is closed'));
+    if (this.databasePath === ':memory:') return Promise.resolve(this.store.getAlbums(query));
+    const settings = this.readAppSettings();
+    this.readWorker ??= new LibraryReadWorker(this.databasePath);
+    return this.readWorker.read('albums', query, {
+      chineseCrossScriptSearchEnabled: settings.chineseCrossScriptSearchEnabled !== false,
+      artistMergeStrategy: settings.artistMergeStrategy ?? 'standard',
+      remoteAlbumMergeStrategy: settings.remoteAlbumMergeStrategy ?? 'conservative',
+    });
+  }
+
   getAlbumsPlaybackSafe(query?: LibraryPageQuery): Promise<LibraryPage<LibraryAlbum>> {
     const key = playbackSafeCacheKey(query);
     return runNonCriticalMainWork({
@@ -1047,6 +1064,9 @@ export class LibraryService {
   }
 
   getArtists(query?: LibraryPageQuery): LibraryPage<LibraryArtist> {
+    if (query?.artistGrouping === 'albumArtist') {
+      return this.albumArtistReadModel.getArtists(query);
+    }
     this.refreshArtistsIfDirty();
     return this.store.getArtists(query);
   }
@@ -1061,11 +1081,16 @@ export class LibraryService {
   }
 
   getArtist(artistId: string): LibraryArtist | null {
+    if (isAlbumArtistId(artistId)) {
+      return this.albumArtistReadModel.getArtist(artistId);
+    }
     return this.store.getArtist(artistId);
   }
 
   async getArtistInsights(artistId: string, options?: ArtistInsightsOptions): Promise<ArtistInsights> {
-    const localInsights = this.store.getArtistInsights(artistId, options);
+    const localInsights = isAlbumArtistId(artistId)
+      ? this.albumArtistReadModel.getArtistInsights(artistId, options)
+      : this.store.getArtistInsights(artistId, options);
     if (options?.includeOnline !== true || !localInsights.artist) {
       return localInsights;
     }
@@ -1102,10 +1127,16 @@ export class LibraryService {
   }
 
   getArtistTracks(artistId: string, query?: Pick<LibraryPageQuery, 'page' | 'pageSize' | 'sort'>): LibraryPage<LibraryTrack> {
+    if (isAlbumArtistId(artistId)) {
+      return this.albumArtistReadModel.getArtistTracks(artistId, query);
+    }
     return this.store.getArtistTracks(artistId, query);
   }
 
   getArtistAlbums(artistId: string, query?: Pick<LibraryPageQuery, 'page' | 'pageSize' | 'sort'>): LibraryPage<LibraryAlbum> {
+    if (isAlbumArtistId(artistId)) {
+      return this.albumArtistReadModel.getArtistAlbums(artistId, query);
+    }
     return this.store.getArtistAlbums(artistId, query);
   }
 
@@ -1166,7 +1197,7 @@ export class LibraryService {
     }
 
     const settings = this.readAppSettings();
-    this.artistImageCacheService.setPaused(settings.autoFetchArtistImages !== true || settings.artistImageFetchPaused === true);
+    this.artistImageCacheService.setPaused(!resolveEffectivePerformancePolicy(settings).artistImageBackgroundFetchEnabled);
     return this.artistImageCacheService.getJobStatus();
   }
 
@@ -1176,7 +1207,7 @@ export class LibraryService {
   }
 
   kickoffArtistImageBackfill(options: { force?: boolean; limit?: number } = {}): ArtistImageJobStatus {
-    if (!this.artistImagesNetworkEnabled() || !this.artistImageCacheService || this.readAppSettings().artistImageFetchPaused === true) {
+    if (!this.artistImagesNetworkEnabled() || !this.artistImageCacheService) {
       return this.getArtistImageJobStatus();
     }
 
@@ -1192,7 +1223,7 @@ export class LibraryService {
     }
 
     const settings = this.readAppSettings();
-    const paused = settings.autoFetchArtistImages !== true || settings.artistImageFetchPaused === true;
+    const paused = !resolveEffectivePerformancePolicy(settings).artistImageBackgroundFetchEnabled;
     this.artistImageCacheService.setPaused(paused);
 
     if (!paused) {
@@ -1313,6 +1344,8 @@ export class LibraryService {
   getDiagnostics(): LibraryDiagnostics {
     const nativeFileScanner = getNativeFileScannerDiagnostics(() => this.readAppSettings().nativeFileScannerEnabled === true);
     const nativeMetadataReader = getNativeMetadataReaderDiagnostics(() => this.readAppSettings().nativeMetadataReaderEnabled === true);
+    const scanConcurrency = this.scanJobQueue.getConfiguredConcurrency();
+    const scanPerformanceMode = resolveEffectivePerformancePolicy(this.readAppSettings()).scanPerformanceMode;
     return {
       ...this.store.getDiagnostics({
         databasePath: this.databasePath,
@@ -1320,9 +1353,9 @@ export class LibraryService {
         coverCachePath: this.coverCacheDir,
         coverCacheSizeBytes: this.getCoverCacheSizeForDiagnostics(),
         cpuCount: this.scanConcurrency.cpuCount,
-        scanPerformanceMode: this.scanConcurrency.mode === 'custom' ? 'balanced' : this.scanConcurrency.mode,
-        metadataConcurrency: this.scanConcurrency.metadataConcurrency,
-        coverConcurrency: this.scanConcurrency.coverConcurrency,
+        scanPerformanceMode,
+        metadataConcurrency: scanConcurrency.metadataConcurrency,
+        coverConcurrency: scanConcurrency.coverConcurrency,
         audioAnalysisEnabled: this.readAppSettings().audioAnalysisEnabled,
       }),
       nativeFileScanner,
@@ -1361,19 +1394,16 @@ export class LibraryService {
 
   syncLiveLibraryWatcherFromSettings(): LibraryLabState {
     const settings = this.readAppSettings();
+    const performancePolicy = resolveEffectivePerformancePolicy(settings);
     const watcher = this.getWatcherService();
-    const enabled = settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherFeatureEnabled();
-    const autoRescanEnabled = settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherAutoRescanEnabled();
+    const enabled = !performancePolicy.lowSpecModeEnabled && (settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherFeatureEnabled());
+    const autoRescanEnabled = !performancePolicy.lowSpecModeEnabled && (settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherAutoRescanEnabled());
 
     watcher.setEnabled(enabled);
     watcher.setAutoRescanEnabled(autoRescanEnabled);
 
     if (enabled) {
-      if (watcher.isRunning()) {
-        watcher.restart();
-      } else {
-        watcher.start();
-      }
+      watcher.syncFolders();
     } else {
       watcher.stop();
     }
@@ -1549,6 +1579,8 @@ export class LibraryService {
       coverUrl?: string | null;
       deferGroupingRefresh?: boolean;
       osuImport?: boolean;
+      osuBeatmapId?: string | null;
+      osuBeatmapsetId?: string | null;
     } = {},
   ): Promise<LibraryTrack> {
     return runMainBackgroundTask('library-import-files', async () => {
@@ -1585,6 +1617,15 @@ export class LibraryService {
       };
       if (options.osuImport === true) {
         fieldSources.osu = 'osu';
+        if (typeof metadataFields.bpm === 'number' && Number.isFinite(metadataFields.bpm) && metadataFields.bpm > 0) {
+          fieldSources.bpm = 'osu';
+        }
+        if (options.osuBeatmapId) {
+          fieldSources[`osuBeatmapId:${options.osuBeatmapId}`] = 'osu';
+        }
+        if (options.osuBeatmapsetId) {
+          fieldSources[`osuBeatmapsetId:${options.osuBeatmapsetId}`] = 'osu';
+        }
       }
       let coverId: string | null = null;
       let coverErrors: string[] = [];
@@ -1746,12 +1787,8 @@ export class LibraryService {
   }
 
   getPlaybackHistoryPlaybackSafe(query?: PlaybackHistoryQuery): Promise<LibraryPage<PlaybackHistoryEntry>> {
-    const key = playbackSafeCacheKey(query);
-    return runNonCriticalMainWork({
-      name: 'library:get-playback-history',
-      work: () => this.rememberPlaybackSafeRead(this.playbackSafePlaybackHistoryCache, key, this.getPlaybackHistory(query)),
-      fallback: () => this.playbackSafePlaybackHistoryCache.get(key) ?? emptyLibraryPage(query),
-    });
+    // Visible history must stay current during playback; only the heavier insights are deferred.
+    return runMainBackgroundTask('library:get-playback-history', () => this.getPlaybackHistory(query));
   }
 
   getPlaybackHistorySummary(query?: PlaybackHistoryQuery): PlaybackHistorySummary {
@@ -1759,12 +1796,7 @@ export class LibraryService {
   }
 
   getPlaybackHistorySummaryPlaybackSafe(query?: PlaybackHistoryQuery): Promise<PlaybackHistorySummary> {
-    const key = playbackSafeCacheKey(query);
-    return runNonCriticalMainWork({
-      name: 'library:get-playback-history-summary',
-      work: () => this.rememberPlaybackSafeRead(this.playbackSafePlaybackHistorySummaryCache, key, this.getPlaybackHistorySummary(query)),
-      fallback: () => this.playbackSafePlaybackHistorySummaryCache.get(key) ?? emptyPlaybackHistorySummary(),
-    });
+    return runMainBackgroundTask('library:get-playback-history-summary', () => this.getPlaybackHistorySummary(query));
   }
 
   getPlaybackStatsDashboard(query?: PlaybackHistoryQuery): PlaybackStatsDashboard {
@@ -1775,12 +1807,30 @@ export class LibraryService {
     return dashboard;
   }
 
+  async getPlaybackStatsDashboardAsync(query?: PlaybackHistoryQuery): Promise<PlaybackStatsDashboard> {
+    if (this.closed) throw new Error('Library service is closed');
+    if (this.databasePath === ':memory:') return this.getPlaybackStatsDashboard(query);
+    const settings = this.readAppSettings();
+    this.readWorker ??= new LibraryReadWorker(this.databasePath);
+    const dashboard = await this.readWorker.read('stats', query, {
+      chineseCrossScriptSearchEnabled: settings.chineseCrossScriptSearchEnabled !== false,
+      artistMergeStrategy: settings.artistMergeStrategy ?? 'standard',
+      remoteAlbumMergeStrategy: settings.remoteAlbumMergeStrategy ?? 'conservative',
+    });
+    this.rememberPlaybackStatsDashboard(query, dashboard);
+    return dashboard;
+  }
+
   getPlaybackMemoryGraph(query?: PlaybackHistoryQuery): PlaybackMemoryGraph {
     return this.rememberPlaybackSafeRead(
       this.playbackMemoryGraphCache,
       playbackSafeCacheKey(query),
       this.store.getPlaybackMemoryGraph(query),
     );
+  }
+
+  getContinuousPlayRecommendations(request: ContinuousPlayRecommendationRequest): ContinuousPlayRecommendationResult {
+    return this.store.getContinuousPlayRecommendations(request);
   }
 
   async getPlaybackMemoryGraphPlaybackSafe(query?: PlaybackHistoryQuery): Promise<PlaybackMemoryGraph> {
@@ -1797,7 +1847,7 @@ export class LibraryService {
 
     return runNonCriticalMainWork({
       name: 'library:get-playback-stats-dashboard',
-      work: () => this.getPlaybackStatsDashboard(query),
+      work: () => this.getPlaybackStatsDashboardAsync(query),
       fallback: () => cached ?? emptyPlaybackStatsDashboard(),
     });
   }
@@ -2593,6 +2643,10 @@ export class LibraryService {
     this.scheduleGroupingRefresh();
   }
 
+  getActiveTracksForFileDeletion(): LibraryTrack[] {
+    return this.store.getActiveTracks();
+  }
+
   deleteTracks(trackIds: string[]): number {
     if (trackIds.length === 0) {
       return 0;
@@ -2694,6 +2748,9 @@ export class LibraryService {
     if (this.hasRunningJobs()) {
       throw new Error('Cannot clear library cache while a library scan is running.');
     }
+    if (!isCoverCacheDirectorySafeToClear(this.databasePath, this.coverCacheDir)) {
+      throw new Error('Cannot clear an external cover cache directory that is not marked as owned by ECHO Next.');
+    }
 
     const scannedCount = this.store.getTracks({ pageSize: 1 }).total;
     const cacheStats = directoryStats(this.coverCacheDir);
@@ -2787,7 +2844,7 @@ export class LibraryService {
     });
   }
 
-  close(): void {
+  close(): Promise<void> {
     this.closed = true;
     this.unregisterSoftMemoryCleanup();
     this.lyricsBackfillJobQueue.dispose();
@@ -2807,6 +2864,10 @@ export class LibraryService {
       clearTimeout(this.searchIndexBackfillTimer);
       this.searchIndexBackfillTimer = null;
     }
+    if (this.bpmBackfillTimer) {
+      clearTimeout(this.bpmBackfillTimer);
+      this.bpmBackfillTimer = null;
+    }
     if (this.groupingRefreshTimer) {
       clearTimeout(this.groupingRefreshTimer);
       this.groupingRefreshTimer = null;
@@ -2816,9 +2877,11 @@ export class LibraryService {
       this.searchIndexBackfillTimer = null;
     }
     (this.scanJobQueue as { dispose?: () => void }).dispose?.();
+    this.bpmAnalysisJobQueue?.dispose();
     this.closeWorkerResources();
 
     this.closeDatabase();
+    return this.readWorker?.close() ?? Promise.resolve();
   }
 
   private bindArtistImagePlaybackDeferral(): void {
@@ -3078,9 +3141,11 @@ export class LibraryService {
 
   private getWatcherService(): LibraryWatcherService {
     if (!this.watcherService) {
+      const settings = this.readAppSettings();
+      const lowSpecModeEnabled = resolveEffectivePerformancePolicy(settings).lowSpecModeEnabled;
       this.watcherService = new LibraryWatcherService({
-        enabled: this.readAppSettings().liveLibraryUpdatesEnabled === true || isLibraryWatcherFeatureEnabled(),
-        autoRescanEnabled: this.readAppSettings().liveLibraryUpdatesEnabled === true || isLibraryWatcherAutoRescanEnabled(),
+        enabled: !lowSpecModeEnabled && (settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherFeatureEnabled()),
+        autoRescanEnabled: !lowSpecModeEnabled && (settings.liveLibraryUpdatesEnabled === true || isLibraryWatcherAutoRescanEnabled()),
         readFolders: () =>
           this.getFolders().map((folder) => ({
             id: folder.id,
@@ -3096,22 +3161,54 @@ export class LibraryService {
             this.lastWatcherRescanPathCount = paths.length;
             this.lastMetadataBackfillCount = metadataBackfillCount;
             const job = this.rescanPaths(folderId, paths, {
-              deferGroupingRefresh: true,
-              skipDeferredGroupingRefresh: true,
               reduceScanPressure: true,
             });
-            void this.scanJobQueue.waitForIdle(job.id)
+            return this.scanJobQueue.waitForIdle(job.id)
               .then(() => {
                 const status = this.store.getScanJob(job.id);
                 this.lastWatcherRescanFinishedAt = new Date().toISOString();
                 this.lastSkippedByCacheCount = status?.skippedFiles ?? 0;
+                if (!status || status.status !== 'completed') {
+                  throw new Error(
+                    status?.errors.at(-1) ??
+                      `Library watcher rescan ended with status ${status?.status ?? 'unknown'}`,
+                  );
+                }
                 this.notifyLibraryChanged();
+                return status;
               })
               .catch((error) => {
                 this.lastWatcherRescanFinishedAt = new Date().toISOString();
                 console.warn(`Library watcher rescan did not complete cleanly: ${error instanceof Error ? error.message : String(error)}`);
+                throw error;
               });
-            return job;
+          },
+          reconcileFolder: (folderId, options) => {
+            const folder = this.store.getFolder(folderId);
+            if (!folder) {
+              throw new Error(`Unknown library folder ${folderId}`);
+            }
+
+            const settings = this.readAppSettings();
+            const job = this.scanJobQueue.scanFolder(folder, {
+              changesOnly: true,
+              markMissing:
+                options.reason !== 'startup' &&
+                settings.liveLibraryUpdatesEnabled === true &&
+                settings.liveLibraryAutoHideDeletedEnabled === true,
+              reduceScanPressure: true,
+              ...(folder.importProfile === 'osu' ? { audioExtensions: ['.mp3'], osuImport: true } : {}),
+            });
+            return this.scanJobQueue.waitForIdle(job.id).then(() => {
+              const status = this.store.getScanJob(job.id);
+              if (!status || status.status !== 'completed') {
+                throw new Error(
+                  status?.errors.at(-1) ??
+                    `Library watcher reconciliation ended with status ${status?.status ?? 'unknown'}`,
+                );
+              }
+              return status;
+            });
           },
           markMissingPaths: (folderId, paths) => {
             const changed = this.store.markTracksMissingByPaths(folderId, paths);
@@ -3119,6 +3216,13 @@ export class LibraryService {
               this.notifyLibraryChanged();
             }
             return changed;
+          },
+          shouldAutoHideDeleted: () => {
+            const settings = this.readAppSettings();
+            return (
+              settings.liveLibraryUpdatesEnabled === true &&
+              settings.liveLibraryAutoHideDeletedEnabled === true
+            );
           },
           previewRescanPaths: (folderId, paths) => this.previewRescanPathsFromWatcher(folderId, paths),
           hasRunningJobs: () => this.scanJobQueue.hasRunningJobs(),
@@ -3203,11 +3307,57 @@ export class LibraryService {
   }
 
   private artistImagesNetworkEnabled(): boolean {
-    return this.readAppSettings().autoFetchArtistImages === true;
+    return resolveEffectivePerformancePolicy(this.readAppSettings()).artistImageBackgroundFetchEnabled;
   }
 
   private backupPlaylist(playlistId: string, reason: PlaylistBackupReason): void {
     backupPlaylistIfEnabled(this.database, playlistId, reason, this.readAppSettings);
+  }
+
+  private scheduleBpmBackfill(delayMs = 1000): void {
+    if (
+      this.closed ||
+      !this.automaticBpmBackfillEnabled ||
+      !this.bpmAnalysisJobQueue ||
+      this.readAppSettings().audioAnalysisEnabled === false ||
+      this.bpmBackfillTimer
+    ) {
+      return;
+    }
+
+    this.bpmBackfillTimer = setTimeout(() => {
+      this.bpmBackfillTimer = null;
+      if (
+        this.closed ||
+        !this.automaticBpmBackfillEnabled ||
+        !this.bpmAnalysisJobQueue ||
+        this.readAppSettings().audioAnalysisEnabled === false
+      ) {
+        return;
+      }
+
+      const queue = this.bpmAnalysisJobQueue;
+      void queue.waitForIdle().then(async () => {
+        if (this.closed || this.readAppSettings().audioAnalysisEnabled === false) {
+          return;
+        }
+        if (await shouldDelayGroupingRefreshForAudio()) {
+          this.scheduleBpmBackfill(bpmBackgroundBackfillStartupDelayMs);
+          return;
+        }
+        const job = queue.start({ limit: bpmBackgroundBackfillBatchSize });
+        await queue.waitForIdle();
+        if (this.closed) {
+          return;
+        }
+        this.notifyLibraryChanged();
+        const completed = queue.getStatus(job.id);
+        if (completed?.totalTracks === bpmBackgroundBackfillBatchSize) {
+          this.scheduleBpmBackfill();
+        }
+      }).catch(() => undefined);
+    }, delayMs);
+    this.bpmBackfillTimer.unref?.();
   }
 
   private scheduleGroupingRefresh(delayMs = 1000): void {
@@ -3441,30 +3591,34 @@ export const createLibraryService = (
     artistMergeStrategy: readSettings().artistMergeStrategy ?? 'standard',
     remoteAlbumMergeStrategy: readSettings().remoteAlbumMergeStrategy ?? 'conservative',
   }));
-  const fileScanner = dependencies.fileScanner ?? new NativeThenTsFileScanner(
+  const ownedNativeFileScanner = dependencies.fileScanner ? null : new NativeThenTsFileScanner(
     undefined,
     new TsFileScanner(),
     console.warn,
     () => getAppSettings().nativeFileScannerEnabled === true,
   );
+  const fileScanner = dependencies.fileScanner ?? ownedNativeFileScanner!;
   const coverCacheDir = dependencies.coverCacheDir
     ? resolveCoverCacheDir(databasePath, dependencies.coverCacheDir)
     : resolveConfiguredCoverCacheDir(databasePath, (dependencies.appSettings ?? getAppSettingsSafe)());
   const albumService = new AlbumService();
-  const appSettings = readSettings();
-  const recommendedScanConcurrency = getRecommendedScanConcurrency({
-    mode: appSettings.scanPerformanceMode ?? 'balanced',
-  });
-  const scanConcurrency: ScanConcurrencyRecommendation = {
-    ...recommendedScanConcurrency,
-    metadataConcurrency: dependencies.metadataConcurrency ?? recommendedScanConcurrency.metadataConcurrency,
-    coverConcurrency: dependencies.coverConcurrency ?? recommendedScanConcurrency.coverConcurrency,
+  const resolveScanConcurrency = (): ScanConcurrencyRecommendation => {
+    const recommended = getRecommendedScanConcurrency({
+      mode: resolveEffectivePerformancePolicy(readSettings()).scanPerformanceMode,
+    });
+    return {
+      ...recommended,
+      metadataConcurrency: dependencies.metadataConcurrency ?? recommended.metadataConcurrency,
+      coverConcurrency: dependencies.coverConcurrency ?? recommended.coverConcurrency,
+    };
   };
+  const scanConcurrency = resolveScanConcurrency();
+  const maximumScanConcurrency = getRecommendedScanConcurrency({ mode: 'ultra' });
   const workerBackedScanWorkers =
     dependencies.metadataReader || dependencies.coverExtractor || dependencies.metadataService
       ? null
       : createWorkerBackedLibraryScanWorkers({
-          workerCount: Math.max(scanConcurrency.metadataConcurrency, scanConcurrency.coverConcurrency),
+          workerCount: Math.max(maximumScanConcurrency.metadataConcurrency, maximumScanConcurrency.coverConcurrency),
         });
   const tsMetadataReader =
     dependencies.metadataService
@@ -3480,20 +3634,26 @@ export const createLibraryService = (
             ),
         }
       : workerBackedScanWorkers?.metadataReader ?? new TsMetadataReader();
-  const metadataReader =
-    dependencies.metadataReader ??
-    new NativeThenTsMetadataReader(
-      undefined,
-      tsMetadataReader,
-      console.warn,
-      () => getAppSettings().nativeMetadataReaderEnabled === true,
-    );
+  const nativeMetadataReaderPool = dependencies.metadataReader
+    ? null
+    : new NativeMetadataReaderPool({
+        poolSize: Math.min(6, maximumScanConcurrency.metadataConcurrency),
+        getProcessPriorityMode: () => resolveEffectivePerformancePolicy(readSettings()).scanPerformanceMode,
+      });
+  const metadataReader = dependencies.metadataReader ?? new NativeThenTsMetadataReader(
+    nativeMetadataReaderPool!,
+    tsMetadataReader,
+    console.warn,
+    () => getAppSettings().nativeMetadataReaderEnabled === true,
+  );
   const coverExtractor = dependencies.coverExtractor ?? workerBackedScanWorkers?.coverExtractor ?? new TsCoverExtractor();
   const scanJobQueue = new ScanJobQueue(store, fileScanner, metadataReader, coverExtractor, albumService, {
     coverCacheDir,
     metadataConcurrency: scanConcurrency.metadataConcurrency,
     coverConcurrency: scanConcurrency.coverConcurrency,
+    getScanConcurrency: resolveScanConcurrency,
     fileIdentityService: workerBackedScanWorkers?.fileIdentityService,
+    searchTermsBuilder: workerBackedScanWorkers?.searchTermsBuilder,
     getAlbumMergeStrategy: () => readSettings().albumMergeStrategy,
     shouldReduceScanPressure: shouldDelayGroupingRefreshForAudio,
     shouldDeferGroupingRefresh: shouldDelayGroupingRefreshForAudio,
@@ -3696,8 +3856,13 @@ export const createLibraryService = (
     albumOnlineInfoService,
     artistOnlineInfoService,
     artistEventsService,
-    () => workerBackedScanWorkers?.close(),
+    () => {
+      ownedNativeFileScanner?.dispose();
+      nativeMetadataReaderPool?.dispose();
+      workerBackedScanWorkers?.close();
+    },
     dependencies.writeEmbeddedTrackTags ?? writeEmbeddedTrackTags,
+    dependencies.automaticBpmBackfill ?? process.env.NODE_ENV !== 'test',
   );
 };
 
@@ -3715,7 +3880,7 @@ const closeDefaultDatabaseUsersBeforeRecovery = async (): Promise<void> => {
   mv.closeDefaultMvService();
   streaming.closeDefaultStreamingService();
   remote.closeDefaultRemoteSourceService();
-  closeDefaultLibraryService();
+  await closeDefaultLibraryService();
   manager.closeAllUsers('scan-recovery');
 };
 
@@ -3747,13 +3912,14 @@ export const getLibraryService = (): LibraryService => {
   return defaultLibraryService;
 };
 
-export const closeDefaultLibraryService = (): void => {
+export const closeDefaultLibraryService = (): Promise<void> => {
   if (!defaultLibraryService) {
-    return;
+    return Promise.resolve();
   }
 
-  defaultLibraryService.close();
+  const closing = defaultLibraryService.close();
   defaultLibraryService = null;
+  return closing;
 };
 
 const pathSize = (targetPath: string): number | null => {
@@ -3912,23 +4078,18 @@ const readCoverImageFromUrl = async (url: string, mimeTypeHint: string | null): 
     throw new Error('封面下载失败，但标签信息仍可应用。');
   }
 
-  const contentLength = Number(response.headers.get('content-length') ?? 0);
-  if (Number.isFinite(contentLength) && contentLength > maxNetworkCoverBytes) {
-    clearTimeout(timeoutId);
-    throw new Error('Network cover is too large; metadata can still be applied.');
-  }
-
   const contentType = response.headers.get('content-type');
   const mimeType = supportedImageMimeType(mimeTypeHint) ?? supportedImageMimeType(contentType) ?? mimeTypeForImageUrl(coverUrl);
   let data: Uint8Array;
   try {
-    data = new Uint8Array(await response.arrayBuffer());
+    data = await readResponseBodyLimited(response, maxNetworkCoverBytes, { signal: controller.signal });
+  } catch (error) {
+    if (error instanceof ResponseBodyTooLargeError) {
+      throw new Error('Network cover is too large; metadata can still be applied.');
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
-  }
-
-  if (data.byteLength > maxNetworkCoverBytes) {
-    throw new Error('Network cover is too large; metadata can still be applied.');
   }
 
   return {
@@ -4036,6 +4197,9 @@ const directorySize = (targetPath: string, options: { maxEntries?: number } = {}
 
       if (stat.isDirectory()) {
         for (const entry of readdirSync(current)) {
+          if (entry === coverCacheOwnershipMarkerName) {
+            continue;
+          }
           pending.push(join(current, entry));
         }
       } else {
@@ -4064,6 +4228,9 @@ const directoryStats = (targetPath: string): { fileCount: number; sizeBytes: num
 
     if (stat.isDirectory()) {
       for (const entry of readdirSync(current)) {
+        if (entry === coverCacheOwnershipMarkerName) {
+          continue;
+        }
         pending.push(join(current, entry));
       }
     } else {
@@ -4079,6 +4246,9 @@ const clearDirectoryContents = (targetPath: string): void => {
   mkdirSync(targetPath, { recursive: true });
 
   for (const entry of readdirSync(targetPath)) {
+    if (entry === coverCacheOwnershipMarkerName) {
+      continue;
+    }
     rmSync(join(targetPath, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 };

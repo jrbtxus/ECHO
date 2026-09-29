@@ -16,7 +16,7 @@ vi.mock('./ExceptionRecorder', () => ({
   recordDiagnosticConsoleProblem: vi.fn(),
 }));
 
-import { beginMainBackgroundTask } from './PlaybackPerformanceDiagnostics';
+import { beginIpcMainHandler, beginMainBackgroundTask } from './PlaybackPerformanceDiagnostics';
 import { clearDevConsole, createDevConsoleHtml, getDevConsoleSnapshot, recordPerformanceStall } from './DevConsoleService';
 import { clearRuntimePerformanceDiagnosticsForTests, getRecentRuntimePerformanceStalls } from './RuntimePerformanceDiagnostics';
 
@@ -96,6 +96,62 @@ describe('DevConsoleService performance stalls', () => {
     expect(entry?.message).toContain('why: database:open:echo-library.sqlite recently took 2400ms');
     expect(entry?.message).toContain('lastBackgroundTask: database:open:echo-library.sqlite');
     expect(entry?.message).toContain('lastBackgroundTaskMs: 2400');
+  });
+
+  it('names the IPC handler that occupied the main thread before a delayed stall report', () => {
+    const base = Date.now() + 40_000;
+    let now = base;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const completeIpc = beginIpcMainHandler('library:get-playback-stats-dashboard');
+    now = base + 6_600;
+    completeIpc();
+    now = base + 6_700;
+
+    const entry = recordPerformanceStall(
+      {
+        source: 'main',
+        kind: 'event_loop',
+        durationMs: 6_657,
+        thresholdMs: 1_000,
+        timestamp: '2026-07-14T05:46:22.420Z',
+        details: { expectedIntervalMs: 500 },
+      },
+      { state: 'paused', outputMode: 'shared' },
+    );
+
+    expect(entry?.message).toContain('probableCause: recent_blocking_ipc_handler');
+    expect(entry?.message).toContain('IPC "library:get-playback-stats-dashboard" occupied 6600ms');
+    expect(entry?.message).toContain('lastIpcChannel: library:get-playback-stats-dashboard');
+    expect(entry?.message).toContain('lastIpcMs: 6600');
+  });
+
+  it('retains the 5-second tracks query when smaller handlers finish before the stall timer', () => {
+    const base = Date.now() + 80_000;
+    let now = base;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const finishTracks = beginIpcMainHandler('library:get-tracks');
+    now += 5_258;
+    finishTracks();
+    const finishAlbums = beginIpcMainHandler('library:get-albums');
+    now += 397;
+    finishAlbums();
+    const finishArtists = beginIpcMainHandler('library:get-artists');
+    now += 22;
+    finishArtists();
+    now += 2;
+
+    const payload: DiagnosticPerformanceStallPayload = {
+      source: 'main', kind: 'event_loop', durationMs: 5_293, thresholdMs: 1_000,
+      timestamp: new Date(now).toISOString(), details: { expectedIntervalMs: 500 },
+    };
+    const entry = recordPerformanceStall(payload, { state: 'idle', outputMode: 'asio' });
+    expect(entry?.message).toContain('IPC "library:get-tracks" recently took 5258ms');
+    expect(entry?.message).toContain('confidence: medium');
+
+    // A later, separate stall must not inherit this query as its cause.
+    now += 40_000;
+    const laterEntry = recordPerformanceStall({ ...payload, timestamp: new Date(now).toISOString() });
+    expect(laterEntry?.message).not.toContain('IPC "library:get-tracks" recently took');
   });
 
   it('keeps controls alive when data-url storage is unavailable', async () => {

@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import {
   Captions,
   Check,
   ChevronDown,
+  Eye,
   Database,
   EyeOff,
   FolderOpen,
   Globe2,
   GripVertical,
   Image as ImageIcon,
+  Keyboard,
   Languages,
   Lock,
   Monitor,
@@ -28,6 +30,7 @@ import {
   Zap,
 } from 'lucide-react';
 import type { AppSettings, LyricsMiniPlayerColorMode } from '../../../shared/types/appSettings';
+import { validateGlobalShortcutAccelerator } from '../../../shared/types/globalShortcuts';
 import type { DesktopLyricsState, DesktopLyricsStylePatch } from '../../../shared/types/desktopLyrics';
 import type { LibraryTrack } from '../../../shared/types/library';
 import type { MvSettings } from '../../../shared/types/mv';
@@ -39,12 +42,19 @@ import type {
   TrackLyrics,
 } from '../../../shared/types/lyrics';
 import { neteaseDjRadioPlaylistPrefix } from '../../../shared/types/streaming';
+import { isImeComposingKeyEvent } from '../../utils/imeInput';
+import {
+  acceleratorFromKeyboardEvent,
+  acceleratorFromMouseEvent,
+  formatAcceleratorForDisplay,
+} from '../../utils/shortcutAccelerator';
 import { registerAppearanceFontFile } from '../../preferences/appearancePreferences';
 import { translateFallback, useOptionalI18n } from '../../i18n/I18nProvider';
 import type { TranslationKey } from '../../i18n/locales';
 import { useOptionalPlaybackQueue } from '../../stores/PlaybackQueueProvider';
 import { DrawerSmartSearch } from '../common/DrawerSmartSearch';
 import { StyledSelect } from '../ui/StyledSelect';
+import { SettingHelpTooltip } from '../../pages/settings/components/SettingHelpTooltip';
 import {
   recordLyricsSourceQualityCandidates,
   recordLyricsSourceQualityOutcome,
@@ -58,11 +68,16 @@ type LyricsSettingsDrawerProps = {
 };
 
 type LyricsSettingsPanelProps = {
+  activeCategory?: LyricsSettingsCategory;
   className?: string;
   currentTrackTools?: ReactNode;
   highlightedSettingId?: string | null;
+  isActive?: boolean;
   variant?: 'drawer' | 'settings';
 };
+
+type LyricsSettingsCategory = 'match' | 'display' | 'desktop' | 'advanced';
+const lyricsSettingsPanelMountDelayMs = 380;
 
 type LyricsSettingsSectionProps = {
   buttonClassName?: string;
@@ -105,6 +120,57 @@ const LyricsSettingsSection = ({
   </section>
 );
 
+type LyricsSettingsProgressiveSectionProps = {
+  children: ReactNode;
+  className?: string;
+  icon: ReactNode;
+  isOpen: boolean;
+  onToggle: () => void;
+  summary: string;
+  title: string;
+};
+
+const LyricsSettingsProgressiveSection = ({
+  children,
+  className,
+  icon,
+  isOpen,
+  onToggle,
+  summary,
+  title,
+}: LyricsSettingsProgressiveSectionProps): JSX.Element => (
+  <section
+    className={`lyrics-settings-progressive-section${isOpen ? ' lyrics-settings-progressive-section--open' : ''} ${className ?? ''}`.trim()}
+    data-collapsed={isOpen ? 'false' : 'true'}
+  >
+    <button type="button" aria-expanded={isOpen} onClick={onToggle}>
+      <span className="lyrics-settings-progressive-section__icon">{icon}</span>
+      <span className="lyrics-settings-progressive-section__copy">
+        <strong>{title}</strong>
+        <small>{summary}</small>
+      </span>
+      <ChevronDown size={17} aria-hidden="true" />
+    </button>
+    <div className="lyrics-settings-progressive-section__shell" aria-hidden={!isOpen} {...(!isOpen ? { inert: '' } : {})}>
+      <div className="lyrics-settings-progressive-section__content">{children}</div>
+    </div>
+  </section>
+);
+
+type LyricsSettingsCategoryHeaderProps = {
+  description: string;
+  title: string;
+};
+
+const LyricsSettingsCategoryHeader = ({ description, title }: LyricsSettingsCategoryHeaderProps): JSX.Element => (
+  <header className="lyrics-settings-category-header">
+    <div className="setting-info-heading">
+      <h3>{title}</h3>
+      <SettingHelpTooltip label={title}>{description}</SettingHelpTooltip>
+    </div>
+  </header>
+);
+
 type LocalFontData = {
   family: string;
 };
@@ -114,8 +180,6 @@ type NavigatorWithLocalFonts = Navigator & {
 };
 
 type LyricsFontPickerTarget = 'lyrics' | 'desktopLyrics';
-
-const drawerExitAnimationMs = 480;
 
 type LyricsDrawerSettings = Pick<
   AppSettings,
@@ -142,6 +206,8 @@ type LyricsDrawerSettings = Pick<
   | 'lyricsPlayerBarDrawerEnabled'
   | 'lyricsPlayerBarDrawerAutoEnableForMv'
   | 'lyricsPlayerBarDrawerAutoHideEnabled'
+  | 'lyricsPlayerBarDrawerShortcutEnabled'
+  | 'lyricsPlayerBarDrawerShortcutAccelerator'
   | 'lyricsPlayerBarDrawerCompactOnIdleEnabled'
   | 'lyricsPlayerBarDrawerOpacityPercent'
   | 'lyricsPlayerBarDrawerColorMode'
@@ -187,7 +253,7 @@ const fallbackSettings: LyricsDrawerSettings = {
   lyricsNetworkEnabled: true,
   lyricsAutoSearch: true,
   lyricsAutoApplyEnabled: true,
-  lyricsAutoAcceptScore: 0.5,
+  lyricsAutoAcceptScore: 0.78,
   lyricsRestartOnApplyEnabled: false,
   lyricsAutoSaveSidecarEnabled: false,
   lyricsDefaultOffsetMs: 0,
@@ -207,6 +273,8 @@ const fallbackSettings: LyricsDrawerSettings = {
   lyricsPlayerBarDrawerEnabled: true,
   lyricsPlayerBarDrawerAutoEnableForMv: true,
   lyricsPlayerBarDrawerAutoHideEnabled: false,
+  lyricsPlayerBarDrawerShortcutEnabled: false,
+  lyricsPlayerBarDrawerShortcutAccelerator: null,
   lyricsPlayerBarDrawerCompactOnIdleEnabled: false,
   lyricsPlayerBarDrawerOpacityPercent: 78,
   lyricsPlayerBarDrawerColorMode: 'default',
@@ -468,7 +536,7 @@ const formatDuration = (durationSeconds: number | null): string => {
 };
 
 const formatScore = (score: number): string => `${Math.round(score * 100)}%`;
-const thresholdFromPercent = (value: string): number => Math.max(30, Math.min(100, Math.round(Number(value)))) / 100;
+const thresholdFromPercent = (value: string): number => Math.max(78, Math.min(100, Math.round(Number(value)))) / 100;
 const sanitizeFontFamily = (value: string): string => value.replace(/[\r\n;]/g, '').trim();
 
 const LyricsFontPickerModal = ({
@@ -569,6 +637,7 @@ const lyricsCandidateReasonLabelKeys: Partial<Record<string, TranslationKey>> = 
   album_match: 'lyricsSettings.candidate.reason.albumMatch',
   duration_exact: 'lyricsSettings.candidate.reason.durationExact',
   duration_close: 'lyricsSettings.candidate.reason.durationClose',
+  duration_tolerated: 'lyricsSettings.candidate.reason.durationTolerated',
   duration_mismatch: 'lyricsSettings.candidate.reason.durationMismatch',
   version_match: 'lyricsSettings.candidate.reason.versionMatch',
   version_conflict: 'lyricsSettings.candidate.reason.versionConflict',
@@ -654,26 +723,6 @@ const mergeLyricsCandidates = (
   return Array.from(merged.values()).sort((left, right) => right.score - left.score);
 };
 
-const isAutoApplyRiskAllowed = (candidate: LyricsSearchCandidate): boolean => {
-  const risk = candidate.risk ?? 'low';
-  if (risk === 'low') {
-    return true;
-  }
-
-  const reasons = new Set(candidate.reasons ?? []);
-  const titleScore = candidate.titleScore ?? (reasons.has('title_exact') ? 1 : 0);
-  const artistScore = candidate.artistScore ?? (reasons.has('artist_exact') ? 1 : 0);
-  const hasOnlyDurationMismatch =
-    reasons.has('duration_mismatch') &&
-    !reasons.has('artist_mismatch') &&
-    !reasons.has('version_conflict') &&
-    !reasons.has('rejected_by_user') &&
-    !reasons.has('candidate_only_cover') &&
-    !reasons.has('cover_intent');
-
-  return hasOnlyDurationMismatch && titleScore >= 0.98 && artistScore >= 0.98;
-};
-
 const selectAutoApplyLyricsCandidate = (
   candidates: LyricsSearchCandidate[],
   settings: Pick<LyricsDrawerSettings, 'lyricsAutoAcceptScore' | 'lyricsAutoApplyEnabled' | 'lyricsAutoSearch'>,
@@ -682,14 +731,11 @@ const selectAutoApplyLyricsCandidate = (
     return null;
   }
 
-  const threshold = Number.isFinite(settings.lyricsAutoAcceptScore)
-    ? Math.max(0.3, Math.min(1, settings.lyricsAutoAcceptScore))
-    : fallbackSettings.lyricsAutoAcceptScore;
-
   return candidates.find(
     (candidate) =>
-      candidate.score >= threshold &&
-      isAutoApplyRiskAllowed(candidate) &&
+      candidate.autoAcceptEligible === true &&
+      candidate.confidence !== 'blocked' &&
+      candidate.risk !== 'high' &&
       (candidate.hasSynced || candidate.hasPlain || candidate.instrumental),
   ) ?? null;
 };
@@ -732,6 +778,9 @@ const selectLyricsSettings = (settings: AppSettings): LyricsDrawerSettings => ({
   lyricsPlayerBarDrawerEnabled: settings.lyricsPlayerBarDrawerEnabled !== false,
   lyricsPlayerBarDrawerAutoEnableForMv: settings.lyricsPlayerBarDrawerAutoEnableForMv !== false,
   lyricsPlayerBarDrawerAutoHideEnabled: settings.lyricsPlayerBarDrawerAutoHideEnabled === true,
+  lyricsPlayerBarDrawerShortcutEnabled: settings.lyricsPlayerBarDrawerShortcutEnabled === true,
+  lyricsPlayerBarDrawerShortcutAccelerator:
+    validateGlobalShortcutAccelerator(settings.lyricsPlayerBarDrawerShortcutAccelerator).accelerator,
   lyricsPlayerBarDrawerCompactOnIdleEnabled: settings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true,
   lyricsPlayerBarDrawerOpacityPercent: settings.lyricsPlayerBarDrawerOpacityPercent ?? fallbackSettings.lyricsPlayerBarDrawerOpacityPercent,
   lyricsPlayerBarDrawerColorMode: settings.lyricsPlayerBarDrawerColorMode ?? fallbackSettings.lyricsPlayerBarDrawerColorMode,
@@ -775,7 +824,14 @@ const selectLyricsSettings = (settings: AppSettings): LyricsDrawerSettings => ({
   desktopLyricsHideWhenNoLyricsEnabled: settings.desktopLyricsHideWhenNoLyricsEnabled === true,
 });
 
-export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedSettingId = null, variant = 'drawer' }: LyricsSettingsPanelProps): JSX.Element => {
+const LyricsSettingsPanelComponent = ({
+  activeCategory,
+  className,
+  currentTrackTools,
+  highlightedSettingId = null,
+  isActive = true,
+  variant = 'drawer',
+}: LyricsSettingsPanelProps): JSX.Element => {
   const t = useOptionalI18n()?.t ?? translateFallback;
   const [settings, setSettings] = useState<LyricsDrawerSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -783,7 +839,9 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   const [currentLyricsProviderLabel, setCurrentLyricsProviderLabel] = useState(providerLabelFor(null, t));
   const [currentLyricsTitleLabel, setCurrentLyricsTitleLabel] = useState(providerLabelFor(null, t));
   const [draggingSourceId, setDraggingSourceId] = useState<LyricsProviderId | null>(null);
-  const [isLyricsDisplayPanelOpen, setIsLyricsDisplayPanelOpen] = useState(readLyricsDisplayPanelOpen);
+  const [isLyricsDisplayPanelOpen, setIsLyricsDisplayPanelOpen] = useState(
+    variant === 'settings' ? false : readLyricsDisplayPanelOpen,
+  );
   const [isLyricsStyleControlsOpen, setIsLyricsStyleControlsOpen] = useState(readLyricsStyleControlsOpen);
   const [fontFamilies, setFontFamilies] = useState<string[]>(fallbackLyricsFontFamilies);
   const [isFontPickerOpen, setIsFontPickerOpen] = useState(false);
@@ -794,7 +852,10 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   const [isBackgroundTuningOpen, setIsBackgroundTuningOpen] = useState(readLyricsBackgroundTuningOpen);
   const [isCurrentTrackSectionOpen, setIsCurrentTrackSectionOpen] = useState(true);
   const [isLyricsMiniPlayerSectionOpen, setIsLyricsMiniPlayerSectionOpen] = useState(variant !== 'drawer');
-  const [isLyricsTextStyleSectionOpen, setIsLyricsTextStyleSectionOpen] = useState(variant !== 'drawer');
+  const [isMiniPlayerTriggerSectionOpen, setIsMiniPlayerTriggerSectionOpen] = useState(variant === 'settings');
+  const [isMiniPlayerBehaviorSectionOpen, setIsMiniPlayerBehaviorSectionOpen] = useState(false);
+  const [isMiniPlayerAppearanceSectionOpen, setIsMiniPlayerAppearanceSectionOpen] = useState(false);
+  const [isLyricsTextStyleSectionOpen, setIsLyricsTextStyleSectionOpen] = useState(false);
   const [isDesktopLyricsSectionOpen, setIsDesktopLyricsSectionOpen] = useState(variant !== 'drawer');
   const [isLyricsBackgroundSectionOpen, setIsLyricsBackgroundSectionOpen] = useState(variant !== 'drawer');
   const [isLyricsOnlineSectionOpen, setIsLyricsOnlineSectionOpen] = useState(false);
@@ -812,6 +873,8 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   const [applyingLyricsCandidateId, setApplyingLyricsCandidateId] = useState<string | null>(null);
   const [isMarkingInstrumental, setIsMarkingInstrumental] = useState(false);
   const [currentLyricsKind, setCurrentLyricsKind] = useState<TrackLyrics['kind'] | null>(null);
+  const [isMiniPlayerShortcutRecording, setIsMiniPlayerShortcutRecording] = useState(false);
+  const [miniPlayerShortcutMessage, setMiniPlayerShortcutMessage] = useState<string | null>(null);
   const saveRequestIdRef = useRef(0);
   const debouncedSaveRequestIdRef = useRef(0);
   const debouncedSaveTimerRef = useRef<number | null>(null);
@@ -837,6 +900,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   const miniPlayerColorModeOptions = useMemo(
     () => [
       { mode: 'default', label: t('lyricsSettings.display.miniPlayerDefaultDark') },
+      { mode: 'light', label: t('lyricsSettings.display.miniPlayerDefaultLight') },
       { mode: 'custom', label: t('lyricsSettings.font.custom') },
       { mode: 'cover', label: t('lyricsSettings.background.mode.cover') },
     ] satisfies Array<{ mode: LyricsMiniPlayerColorMode; label: string }>,
@@ -933,7 +997,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
     );
   }, [effectiveSettings.lyricsEnabledProviders, effectiveSettings.lyricsNetworkEnabled, effectiveSettings.lyricsProviderOrder]);
   const thresholdPercent = Math.round(effectiveSettings.lyricsAutoAcceptScore * 100);
-  const thresholdProgress = getRangeProgressPercent(thresholdPercent, 30, 100);
+  const thresholdProgress = getRangeProgressPercent(thresholdPercent, 78, 100);
   const miniPlayerOpacityPercent = effectiveSettings.lyricsPlayerBarDrawerOpacityPercent ?? fallbackSettings.lyricsPlayerBarDrawerOpacityPercent;
   const miniPlayerColor = effectiveSettings.lyricsPlayerBarDrawerColor ?? fallbackSettings.lyricsPlayerBarDrawerColor ?? '#232120';
   const hasDesktopLyricsBridge = Boolean(window.echo?.desktopLyrics);
@@ -1229,6 +1293,80 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
       }
     }
   }, []);
+
+  const commitMiniPlayerShortcut = useCallback((rawAccelerator: string | null): void => {
+    const validation = validateGlobalShortcutAccelerator(rawAccelerator);
+    if (!validation.valid || !validation.accelerator) {
+      setMiniPlayerShortcutMessage(t('settings.shortcuts.message.invalid'));
+      return;
+    }
+
+    setMiniPlayerShortcutMessage(null);
+    setIsMiniPlayerShortcutRecording(false);
+    void patchSettings({ lyricsPlayerBarDrawerShortcutAccelerator: validation.accelerator });
+  }, [patchSettings, t]);
+
+  useEffect(() => {
+    if (!isActive || !isMiniPlayerShortcutRecording) {
+      return undefined;
+    }
+
+    document.body.dataset.echoShortcutRecording = 'true';
+
+    const handleShortcutKeyDown = (event: KeyboardEvent): void => {
+      if (isImeComposingKeyEvent(event)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.key === 'Escape') {
+        setMiniPlayerShortcutMessage(null);
+        setIsMiniPlayerShortcutRecording(false);
+        return;
+      }
+
+      commitMiniPlayerShortcut(acceleratorFromKeyboardEvent(event));
+    };
+
+    const handleShortcutMouseEvent = (event: MouseEvent): void => {
+      const accelerator = acceleratorFromMouseEvent(event);
+      if (!accelerator) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      commitMiniPlayerShortcut(accelerator);
+    };
+
+    const handleShortcutContextMenu = (event: MouseEvent): void => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    window.addEventListener('keydown', handleShortcutKeyDown, true);
+    window.addEventListener('mousedown', handleShortcutMouseEvent, true);
+    window.addEventListener('mouseup', handleShortcutMouseEvent, true);
+    window.addEventListener('auxclick', handleShortcutMouseEvent, true);
+    window.addEventListener('contextmenu', handleShortcutContextMenu, true);
+    return () => {
+      window.removeEventListener('keydown', handleShortcutKeyDown, true);
+      window.removeEventListener('mousedown', handleShortcutMouseEvent, true);
+      window.removeEventListener('mouseup', handleShortcutMouseEvent, true);
+      window.removeEventListener('auxclick', handleShortcutMouseEvent, true);
+      window.removeEventListener('contextmenu', handleShortcutContextMenu, true);
+      delete document.body.dataset.echoShortcutRecording;
+    };
+  }, [commitMiniPlayerShortcut, isActive, isMiniPlayerShortcutRecording]);
+
+  useEffect(() => {
+    if (!isActive && isMiniPlayerShortcutRecording) {
+      setMiniPlayerShortcutMessage(null);
+      setIsMiniPlayerShortcutRecording(false);
+    }
+  }, [isActive, isMiniPlayerShortcutRecording]);
 
   const flushDebouncedSettings = useCallback(async (): Promise<void> => {
     const app = window.echo?.app;
@@ -1679,7 +1817,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
         setIsLyricsCandidateLoading(false);
       }
     },
-    [activeSearchProviders, applyLyricsCandidateToTarget, effectiveSettings, resolveCurrentLyricsTarget, t],
+    [activeSearchProviders, effectiveSettings, resolveCurrentLyricsTarget, t],
   );
 
   const rematchLyricsCandidates = useCallback(async (): Promise<void> => {
@@ -1825,8 +1963,46 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   }, [effectiveSettings.lyricsEnabled, resolveCurrentTrackId, t]);
 
   useEffect(() => {
-    void refreshDrawerSummary();
-  }, [refreshDrawerSummary]);
+    if (isActive) {
+      void refreshDrawerSummary();
+    }
+  }, [isActive, refreshDrawerSummary]);
+
+  useEffect(() => {
+    const handleReset = (): void => {
+      void patchSettings(fallbackSettings as Partial<AppSettings>);
+    };
+    window.addEventListener('lyrics-settings:reset', handleReset);
+    return () => window.removeEventListener('lyrics-settings:reset', handleReset);
+  }, [patchSettings]);
+
+  useEffect(() => {
+    if (variant !== 'drawer' || !activeCategory) {
+      return;
+    }
+
+    // Keep every category mounted so search, keyboard navigation and existing
+    // drawer actions remain available; CSS exposes only the selected page.
+    setIsCurrentTrackSectionOpen(true);
+    setIsLyricsMiniPlayerSectionOpen(true);
+    setIsLyricsTextStyleSectionOpen(true);
+    setIsDesktopLyricsSectionOpen(true);
+  }, [activeCategory, variant]);
+
+  useEffect(() => {
+    if (
+      highlightedSettingId !== 'settings-row-lyrics-romanization' &&
+      highlightedSettingId !== 'settings-row-lyrics-translation' &&
+      highlightedSettingId !== 'settings-row-lyrics-color'
+    ) {
+      return;
+    }
+
+    setIsLyricsTextStyleSectionOpen(true);
+    if (highlightedSettingId === 'settings-row-lyrics-color') {
+      setIsLyricsStyleControlsOpen(true);
+    }
+  }, [highlightedSettingId]);
 
   useEffect(() => {
     const handleCurrentLyricsProviderChanged = (event: Event): void => {
@@ -1851,7 +2027,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   }, [loadCurrentLyricsProvider, t]);
 
   return (
-    <div className={`lyrics-settings-panel ${className ?? ''}`.trim()}>
+    <div className={`lyrics-settings-panel ${className ?? ''}`.trim()} data-category={activeCategory}>
       {showCurrentTrackTools ? (
         <button className="audio-engine-meter lyrics-engine-meter" type="button" disabled={isBusy} onClick={() => void refreshDrawerSummary()}>
           <div className="audio-engine-meter__top">
@@ -1895,31 +2071,38 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           title={t('lyricsSettings.currentTrack.title')}
         >
           <form
-            className="audio-device-pill lyrics-search-pill"
+            className="lyrics-current-search-card"
             onSubmit={(event) => {
               event.preventDefault();
               dispatchLyricsAction('search', lyricsSearchQuery);
               void searchLyricsCandidates(lyricsSearchQuery);
             }}
           >
-            <Search size={15} />
-            <span>
-              <strong>{t('lyricsSettings.currentTrack.searchLyrics')}</strong>
-              <small>{t('lyricsSettings.currentTrack.searchHint')}</small>
-            </span>
-            <div className="lyrics-search-pill__field">
-              <input
-                type="search"
-                value={lyricsSearchQuery}
-                disabled={isBusy || isLyricsCandidateLoading || !effectiveSettings.lyricsEnabled}
-                placeholder={t('lyricsSettings.currentTrack.searchPlaceholder')}
-                aria-label={t('lyricsSettings.currentTrack.searchInput')}
-                onChange={(event) => setLyricsSearchQuery(event.currentTarget.value)}
-              />
+            <div className="lyrics-current-search-card__header">
+              <span className="lyrics-current-search-card__icon">
+                <Search size={16} />
+              </span>
+              <span className="lyrics-current-search-card__copy">
+                <strong>{t('lyricsSettings.currentTrack.searchLyrics')}</strong>
+                <small>{t('lyricsSettings.currentTrack.searchHint')}</small>
+              </span>
             </div>
-            <button type="submit" disabled={isBusy || isLyricsCandidateLoading || !effectiveSettings.lyricsEnabled}>
-              {t('lyricsSettings.action.search')}
-            </button>
+            <div className="lyrics-current-search-card__controls">
+              <label className="lyrics-current-search-card__field">
+                <Search size={15} aria-hidden="true" />
+                <input
+                  type="search"
+                  value={lyricsSearchQuery}
+                  disabled={isBusy || isLyricsCandidateLoading || !effectiveSettings.lyricsEnabled}
+                  placeholder={t('lyricsSettings.currentTrack.searchPlaceholder')}
+                  aria-label={t('lyricsSettings.currentTrack.searchInput')}
+                  onChange={(event) => setLyricsSearchQuery(event.currentTarget.value)}
+                />
+              </label>
+              <button type="submit" disabled={isBusy || isLyricsCandidateLoading || !effectiveSettings.lyricsEnabled}>
+                {t('lyricsSettings.action.search')}
+              </button>
+            </div>
           </form>
 
           {(lyricsCandidateStatus || lyricsCandidates.length > 0) ? (
@@ -1943,6 +2126,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                   <div className="lyrics-candidate-list">
                     {visibleLyricsCandidates.map((candidate) => {
                       const candidateKind = lyricsCandidateDisplayKind(candidate);
+                      const candidateReasons = visibleCandidateReasonLabels(candidate, t);
                       return (
                         <button
                           className={`lyrics-candidate lyrics-candidate--${candidateKind}`}
@@ -1953,28 +2137,30 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                           onClick={() => void applyLyricsCandidate(candidate.id)}
                         >
                           <span className="lyrics-candidate-copy">
-                            <strong>{candidate.title}</strong>
-                            <em>
-                              {candidate.artist}
-                              {candidate.album ? ` / ${candidate.album}` : ''} / {formatDuration(candidate.durationSeconds)}
-                            </em>
-                          </span>
-                          <span className="lyrics-candidate-badges">
-                            <small className={`lyrics-risk-badge lyrics-risk-badge--${candidate.risk ?? 'high'}`}>
-                              {riskLabel(candidate.risk, t)}
-                            </small>
-                            <small className={`lyrics-kind-badge lyrics-kind-badge--${candidateKind}`}>
-                              {t(lyricsCandidateDisplayLabelKeys[candidateKind])}
-                            </small>
-                            <small>{candidate.sourceLabel}</small>
-                            <small>{formatScore(candidate.score)}</small>
-                            {visibleCandidateReasonLabels(candidate, t).map((reason) => (
-                              <small className="lyrics-reason-badge" key={reason}>
-                                {reason}
+                            <span className="lyrics-candidate-heading">
+                              <strong>{candidate.title}</strong>
+                              <small className="lyrics-candidate-source">{candidate.sourceLabel}</small>
+                            </span>
+                            <em>{[candidate.artist, candidate.album].filter(Boolean).join(' · ') || '未知艺术家'}</em>
+                            <span className="lyrics-candidate-meta">
+                              <small>{formatDuration(candidate.durationSeconds)}</small>
+                              <small className={`lyrics-kind-badge lyrics-kind-badge--${candidateKind}`}>
+                                {t(lyricsCandidateDisplayLabelKeys[candidateKind])}
                               </small>
-                            ))}
-                            {applyingLyricsCandidateId === candidate.id ? <small>{t('lyricsSettings.status.applying')}</small> : null}
+                              <small>{formatScore(candidate.score)}</small>
+                              <small className={`lyrics-risk-badge lyrics-risk-badge--${candidate.risk ?? 'high'}`}>
+                                {riskLabel(candidate.risk, t)}
+                              </small>
+                            </span>
                           </span>
+                          <span className="lyrics-candidate-action" aria-hidden="true">
+                            {applyingLyricsCandidateId === candidate.id ? t('lyricsSettings.status.applying') : '应用'}
+                          </span>
+                          {candidateReasons.length > 0 ? (
+                            <span className="lyrics-candidate-reason lyrics-reason-badge" title={candidateReasons.join(' · ')}>
+                              {candidateReasons.join(' · ')}
+                            </span>
+                          ) : null}
                         </button>
                       );
                     })}
@@ -2035,20 +2221,423 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           </label>
           <p>默认开启；关闭后，自动匹配和重新匹配只展示候选，需要手动选择歌词。</p>
 
-          <label className="audio-toggle-row">
-            <span>
-              <RotateCcw size={17} />
-              <strong>{t('lyricsSettings.currentTrack.restartOnApply')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsRestartOnApplyEnabled === true}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsRestartOnApplyEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.currentTrack.restartOnApplyDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.currentTrack.restartOnApplyDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <RotateCcw size={17} />
+                <strong>{t('lyricsSettings.currentTrack.restartOnApply')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsRestartOnApplyEnabled === true}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsRestartOnApplyEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.currentTrack.restartOnApply')}>{t('lyricsSettings.currentTrack.restartOnApplyDescription')}</SettingHelpTooltip>
+          </div>
         </LyricsSettingsSection>
+      ) : null}
+
+      {variant === 'settings' ? (
+        <>
+          <LyricsSettingsCategoryHeader
+            title={t('lyricsSettings.groups.basics')}
+            description={t('lyricsSettings.groups.basicsDescription')}
+          />
+          <div className="lyrics-settings-progressive" data-search-keywords="lyrics display mini player shortcut mv auto hide appearance">
+          <section
+            className={`lyrics-settings-master-section${isLyricsDisplayPanelOpen ? ' lyrics-settings-master-section--open' : ''}`}
+          >
+            <div className="lyrics-settings-master-row">
+              <button
+                className="lyrics-settings-master-row__copy"
+                type="button"
+                aria-expanded={isLyricsDisplayPanelOpen}
+                onClick={toggleLyricsDisplayPanel}
+              >
+                <span className="lyrics-settings-master-row__icon">
+                  <Eye size={20} />
+                </span>
+                <span>
+                  <strong>{t('lyricsSettings.display.title')}</strong>
+                  <small>{t('lyricsSettings.display.description')}</small>
+                </span>
+                <ChevronDown size={17} aria-hidden="true" />
+              </button>
+              <label className="lyrics-settings-master-row__actions">
+                <span data-enabled={effectiveSettings.lyricsEnabled ? 'true' : 'false'}>
+                  {t(effectiveSettings.lyricsEnabled ? 'lyricsSettings.status.on' : 'lyricsSettings.status.off')}
+                </span>
+                <input
+                  type="checkbox"
+                  aria-label={t('lyricsSettings.display.enableLyrics')}
+                  checked={effectiveSettings.lyricsEnabled}
+                  disabled={isBusy}
+                  onChange={(event) => void patchSettings({ lyricsEnabled: event.currentTarget.checked })}
+                />
+              </label>
+            </div>
+            <div
+              className="lyrics-settings-master-section__shell"
+              aria-hidden={!isLyricsDisplayPanelOpen}
+              {...(!isLyricsDisplayPanelOpen ? { inert: '' } : {})}
+            >
+              <div className="lyrics-settings-master-section__details">
+                <label className="mv-threshold-control lyrics-match-threshold-control">
+                  <span className="mv-threshold-copy">
+                    <strong>{t('lyricsSettings.display.matchThreshold')}</strong>
+                    <em>{t('lyricsSettings.display.matchThresholdDescription', { threshold: thresholdPercent })}</em>
+                  </span>
+                  <span className="mv-threshold-slider">
+                    <input
+                      type="range"
+                      min="78"
+                      max="100"
+                      step="1"
+                      value={thresholdPercent}
+                      aria-label={t('lyricsSettings.display.matchThreshold')}
+                      disabled={isBusy}
+                      style={{ '--lyrics-drawer-range-progress': `${thresholdProgress}%` } as CSSProperties}
+                      onChange={(event) => patchSettingsDebounced({ lyricsAutoAcceptScore: thresholdFromPercent(event.currentTarget.value) })}
+                    />
+                    <strong>{thresholdPercent}%</strong>
+                  </span>
+                </label>
+                <div className="lyrics-settings-master-section__grid">
+                  <label className="audio-toggle-row">
+                    <span>
+                      <EyeOff size={17} />
+                      <strong>{t('lyricsSettings.display.hideTrackInfo')}</strong>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={effectiveSettings.lyricsHeaderHidden}
+                      disabled={isBusy}
+                      onChange={(event) => toggleLyricsHeaderHidden(event.currentTarget.checked)}
+                    />
+                  </label>
+                  <label className="audio-toggle-row">
+                    <span>
+                      <Captions size={17} />
+                      <strong>{t('lyricsSettings.display.autoOpenCandidatePanel')}</strong>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={effectiveSettings.lyricsCandidatePanelAutoOpenEnabled === true}
+                      disabled={isBusy}
+                      onChange={(event) => void patchSettings({ lyricsCandidatePanelAutoOpenEnabled: event.currentTarget.checked })}
+                    />
+                  </label>
+                  <label className="audio-toggle-row">
+                    <span>
+                      <EyeOff size={17} />
+                      <strong>{t('lyricsSettings.display.hideEmptyState')}</strong>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={effectiveSettings.lyricsEmptyStateHidden}
+                      disabled={isBusy}
+                      onChange={(event) => void patchSettings({ lyricsEmptyStateHidden: event.currentTarget.checked })}
+                    />
+                  </label>
+                  {effectiveSettings.lyricsHeaderHidden ? (
+                    <label className="audio-toggle-row">
+                      <span>
+                        <EyeOff size={17} />
+                        <strong>{t('lyricsSettings.display.disableMvTrackInfoAutoShow')}</strong>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={effectiveSettings.lyricsMvAutoShowTrackInfoDisabled}
+                        disabled={isBusy}
+                        onChange={toggleMvAutoShowTrackInfoDisabled}
+                      />
+                    </label>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            className={`lyrics-settings-mini-player${isLyricsMiniPlayerSectionOpen ? ' lyrics-settings-mini-player--open' : ''}`}
+          >
+            <div className="lyrics-settings-mini-player__header">
+              <button
+                className="lyrics-settings-mini-player__copy"
+                type="button"
+                aria-expanded={isLyricsMiniPlayerSectionOpen}
+                onClick={() => setIsLyricsMiniPlayerSectionOpen((value) => !value)}
+              >
+                <span className="lyrics-settings-mini-player__icon">
+                  <Music2 size={20} />
+                </span>
+                <span>
+                  <strong>{t('lyricsSettings.display.miniPlayer')}</strong>
+                  <small>{t('lyricsSettings.display.miniPlayerDescription')}</small>
+                </span>
+                <ChevronDown size={17} aria-hidden="true" />
+              </button>
+              <label className="lyrics-settings-mini-player__toggle">
+                <input
+                  type="checkbox"
+                  aria-label={t('lyricsSettings.display.miniPlayer')}
+                  checked={effectiveSettings.lyricsPlayerBarDrawerEnabled}
+                  disabled={isBusy}
+                  onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerEnabled: event.currentTarget.checked })}
+                />
+              </label>
+            </div>
+            <div
+              className="lyrics-settings-mini-player__shell"
+              aria-hidden={!isLyricsMiniPlayerSectionOpen}
+              {...(!isLyricsMiniPlayerSectionOpen ? { inert: '' } : {})}
+            >
+              <div className="lyrics-settings-mini-player__body">
+                <LyricsSettingsProgressiveSection
+                  className="lyrics-settings-progressive-section--trigger"
+                  icon={<Keyboard size={18} />}
+                  isOpen={isMiniPlayerTriggerSectionOpen}
+                  onToggle={() => setIsMiniPlayerTriggerSectionOpen((value) => !value)}
+                  summary={t('lyricsSettings.display.miniPlayerShortcutDescription')}
+                  title={t('lyricsSettings.display.miniPlayerTrigger')}
+                >
+                  <div className="lyrics-settings-progressive-grid">
+                    <div className="lyrics-settings-progressive-control">
+                      <label className="audio-toggle-row">
+                        <span>
+                          <Keyboard size={17} />
+                          <span className="lyrics-toggle-copy">
+                            <strong>{t('lyricsSettings.display.miniPlayerShortcut')}</strong>
+                            <small>{t('lyricsSettings.display.miniPlayerShortcutDescription')}</small>
+                          </span>
+                        </span>
+                        <input
+                          type="checkbox"
+                          aria-label={t('lyricsSettings.display.miniPlayerShortcut')}
+                          checked={effectiveSettings.lyricsPlayerBarDrawerShortcutEnabled === true}
+                          disabled={isBusy}
+                          onChange={(event) => {
+                            const enabled = event.currentTarget.checked;
+                            if (!enabled) {
+                              setIsMiniPlayerShortcutRecording(false);
+                              setMiniPlayerShortcutMessage(null);
+                            }
+                            void patchSettings({ lyricsPlayerBarDrawerShortcutEnabled: enabled });
+                          }}
+                        />
+                      </label>
+                      {effectiveSettings.lyricsPlayerBarDrawerShortcutEnabled ? (
+                        <div
+                          className="lyrics-mini-player-shortcut-control"
+                          role="group"
+                          aria-label={t('lyricsSettings.display.miniPlayerShortcut')}
+                        >
+                          <button
+                            className={`settings-shortcut-key ${isMiniPlayerShortcutRecording ? 'is-recording' : ''}`}
+                            type="button"
+                            aria-label={t('settings.shortcuts.action.record')}
+                            disabled={isBusy}
+                            title={t('settings.shortcuts.action.record')}
+                            onClick={() => {
+                              setMiniPlayerShortcutMessage(null);
+                              setIsMiniPlayerShortcutRecording(true);
+                            }}
+                          >
+                            {isMiniPlayerShortcutRecording
+                              ? t('settings.shortcuts.recording')
+                              : formatAcceleratorForDisplay(
+                                  effectiveSettings.lyricsPlayerBarDrawerShortcutAccelerator,
+                                  t('settings.shortcuts.empty'),
+                                )}
+                          </button>
+                          <button
+                            className="lyrics-mini-player-shortcut-clear"
+                            type="button"
+                            aria-label={t('settings.shortcuts.action.clear')}
+                            disabled={isBusy || !effectiveSettings.lyricsPlayerBarDrawerShortcutAccelerator}
+                            title={t('settings.shortcuts.action.clear')}
+                            onClick={() => {
+                              setIsMiniPlayerShortcutRecording(false);
+                              setMiniPlayerShortcutMessage(null);
+                              void patchSettings({ lyricsPlayerBarDrawerShortcutAccelerator: null });
+                            }}
+                          >
+                            <X size={15} />
+                          </button>
+                          {miniPlayerShortcutMessage ? (
+                            <small className="lyrics-mini-player-shortcut-error">{miniPlayerShortcutMessage}</small>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                    <label className="audio-toggle-row">
+                      <span>
+                        <Captions size={17} />
+                        <span className="lyrics-toggle-copy">
+                          <strong>{t('lyricsSettings.display.miniPlayerAutoMv')}</strong>
+                          <small>{t('lyricsSettings.display.miniPlayerAutoMvDescription')}</small>
+                        </span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        aria-label={t('lyricsSettings.display.miniPlayerAutoMv')}
+                        checked={effectiveSettings.lyricsPlayerBarDrawerAutoEnableForMv !== false}
+                        disabled={isBusy}
+                        onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerAutoEnableForMv: event.currentTarget.checked })}
+                      />
+                    </label>
+                  </div>
+                </LyricsSettingsProgressiveSection>
+
+                <LyricsSettingsProgressiveSection
+                  icon={<TimerReset size={18} />}
+                  isOpen={isMiniPlayerBehaviorSectionOpen}
+                  onToggle={() => setIsMiniPlayerBehaviorSectionOpen((value) => !value)}
+                  summary={`${t('lyricsSettings.display.miniPlayerAutoHide')}、${t('lyricsSettings.display.miniPlayerCompactOnIdle')}`}
+                  title={t('lyricsSettings.display.miniPlayerBehavior')}
+                >
+                  <div className="lyrics-settings-progressive-grid">
+                    <label className="audio-toggle-row">
+                      <span>
+                        <EyeOff size={17} />
+                        <span className="lyrics-toggle-copy">
+                          <strong>{t('lyricsSettings.display.miniPlayerAutoHide')}</strong>
+                          <small>{t('lyricsSettings.display.miniPlayerAutoHideDescription')}</small>
+                        </span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        aria-label={t('lyricsSettings.display.miniPlayerAutoHide')}
+                        checked={effectiveSettings.lyricsPlayerBarDrawerAutoHideEnabled === true}
+                        disabled={
+                          isBusy ||
+                          (effectiveSettings.lyricsPlayerBarDrawerEnabled !== true &&
+                            effectiveSettings.lyricsPlayerBarDrawerAutoEnableForMv === false)
+                        }
+                        onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerAutoHideEnabled: event.currentTarget.checked })}
+                      />
+                    </label>
+                    <label className="audio-toggle-row">
+                      <span>
+                        <EyeOff size={17} />
+                        <span className="lyrics-toggle-copy">
+                          <strong>{t('lyricsSettings.display.miniPlayerCompactOnIdle')}</strong>
+                          <small>{t('lyricsSettings.display.miniPlayerCompactOnIdleDescription')}</small>
+                        </span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        aria-label={t('lyricsSettings.display.miniPlayerCompactOnIdle')}
+                        checked={effectiveSettings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true}
+                        disabled={
+                          isBusy ||
+                          (effectiveSettings.lyricsPlayerBarDrawerEnabled !== true &&
+                            effectiveSettings.lyricsPlayerBarDrawerAutoEnableForMv === false)
+                        }
+                        onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerCompactOnIdleEnabled: event.currentTarget.checked })}
+                      />
+                    </label>
+                  </div>
+                </LyricsSettingsProgressiveSection>
+
+                <LyricsSettingsProgressiveSection
+                  icon={<Palette size={18} />}
+                  isOpen={isMiniPlayerAppearanceSectionOpen}
+                  onToggle={() => setIsMiniPlayerAppearanceSectionOpen((value) => !value)}
+                  summary={`${t('lyricsSettings.display.miniPlayerOpacity')} ${miniPlayerOpacityPercent}%、${miniPlayerColorModeLabel}`}
+                  title={t('lyricsSettings.display.miniPlayerAppearance')}
+                >
+                  {effectiveSettings.lyricsPlayerBarDrawerEnabled ? (
+                    <div className="audio-drawer-mini-grid lyrics-mini-player-options">
+                      <div className="lyrics-mini-player-tuning-row">
+                        <label className="lyrics-drawer-range">
+                          <span>
+                            <strong>
+                              <EyeOff size={15} />
+                              {t('lyricsSettings.display.miniPlayerOpacity')}
+                            </strong>
+                            <em>{miniPlayerOpacityPercent}%</em>
+                          </span>
+                          <input
+                            type="range"
+                            min={20}
+                            max={100}
+                            step={1}
+                            value={miniPlayerOpacityPercent}
+                            disabled={isBusy}
+                            onChange={(event) =>
+                              patchSettingsDebounced(
+                                { lyricsPlayerBarDrawerOpacityPercent: Number(event.currentTarget.value) },
+                                { broadcastSettings: true },
+                              )
+                            }
+                          />
+                        </label>
+                        <div className="lyrics-color-panel lyrics-mini-player-color-panel">
+                          <div className="lyrics-color-panel__header">
+                            <span>
+                              <Palette size={15} />
+                              <strong>{t('lyricsSettings.display.miniPlayerColor')}</strong>
+                            </span>
+                            <em>{miniPlayerColorMode === 'custom' ? miniPlayerColor : miniPlayerColorModeLabel}</em>
+                          </div>
+                          <StyledSelect<LyricsMiniPlayerColorMode>
+                            className="lyrics-mini-player-color-mode-select"
+                            ariaLabel={t('lyricsSettings.display.miniPlayerColorMode')}
+                            value={miniPlayerColorMode}
+                            options={miniPlayerColorModeOptions.map((option) => ({ value: option.mode, label: option.label }))}
+                            disabled={isBusy}
+                            showFilterIcon={false}
+                            onChange={(mode) => void patchSettings({ lyricsPlayerBarDrawerColorMode: mode })}
+                          />
+                        </div>
+                      </div>
+                      {miniPlayerColorMode === 'custom' ? (
+                        <>
+                          <div className="lyrics-color-panel__header lyrics-mini-player-custom-color">
+                            <span>
+                              <Palette size={15} />
+                              <strong>{t('lyricsSettings.display.customColor')}</strong>
+                            </span>
+                            <label className="lyrics-color-input" title={t('lyricsSettings.display.chooseMiniPlayerColor')}>
+                              <input
+                                type="color"
+                                value={miniPlayerColor}
+                                disabled={isBusy}
+                                onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerColor: event.currentTarget.value })}
+                              />
+                              <em>{miniPlayerColor}</em>
+                            </label>
+                          </div>
+                          <div className="lyrics-color-swatches" aria-label={t('lyricsSettings.display.miniPlayerPalette')}>
+                            {colorSwatches.map((color) => (
+                              <button
+                                className="lyrics-color-swatch"
+                                type="button"
+                                key={color}
+                                style={{ backgroundColor: color }}
+                                aria-label={t('lyricsSettings.display.useMiniPlayerColor', { color })}
+                                aria-pressed={miniPlayerColor.toUpperCase() === color}
+                                disabled={isBusy}
+                                onClick={() => void patchSettings({ lyricsPlayerBarDrawerColor: color })}
+                              >
+                                {miniPlayerColor.toUpperCase() === color ? <Check size={13} /> : null}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      ) : null}
+                      {miniPlayerColorMode === 'cover' ? <p>{t('lyricsSettings.display.coverMiniPlayerHint')}</p> : null}
+                    </div>
+                  ) : null}
+                </LyricsSettingsProgressiveSection>
+              </div>
+            </div>
+          </section>
+          </div>
+        </>
       ) : null}
 
         <LyricsSettingsSection
@@ -2060,19 +2649,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           onToggle={toggleLyricsDisplayPanel}
           title={t('lyricsSettings.display.title')}
         >
-          <label className="audio-toggle-row">
-            <span>
-              <Captions size={17} />
-              <strong>{t('lyricsSettings.display.enableLyrics')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsEnabled}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.display.enableLyricsDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.enableLyricsDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <Captions size={17} />
+                <strong>{t('lyricsSettings.display.enableLyrics')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsEnabled}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.display.enableLyrics')}>{t('lyricsSettings.display.enableLyricsDescription')}</SettingHelpTooltip>
+          </div>
 
           {showPersistentControls ? (
           <label className="mv-threshold-control lyrics-match-threshold-control">
@@ -2083,7 +2674,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
             <span className="mv-threshold-slider">
               <input
                 type="range"
-                min="30"
+                min="78"
                 max="100"
                 step="1"
                 value={thresholdPercent}
@@ -2141,19 +2732,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           </label>
           {showVisualControls ? (
           <>
-            <label className="audio-toggle-row">
-              <span>
-                <EyeOff size={17} />
-                <strong>{t('lyricsSettings.display.hideEmptyState')}</strong>
-              </span>
-              <input
-                type="checkbox"
-                checked={effectiveSettings.lyricsEmptyStateHidden}
-                disabled={isBusy}
-                onChange={(event) => void patchSettings({ lyricsEmptyStateHidden: event.currentTarget.checked })}
-              />
-            </label>
-            <p>{t('lyricsSettings.display.hideEmptyStateDescription')}</p>
+            <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.hideEmptyStateDescription')}>
+              <label className="audio-toggle-row">
+                <span>
+                  <EyeOff size={17} />
+                  <strong>{t('lyricsSettings.display.hideEmptyState')}</strong>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={effectiveSettings.lyricsEmptyStateHidden}
+                  disabled={isBusy}
+                  onChange={(event) => void patchSettings({ lyricsEmptyStateHidden: event.currentTarget.checked })}
+                />
+              </label>
+              <SettingHelpTooltip label={t('lyricsSettings.display.hideEmptyState')}>{t('lyricsSettings.display.hideEmptyStateDescription')}</SettingHelpTooltip>
+            </div>
           </>
           ) : null}
         </LyricsSettingsSection>
@@ -2176,7 +2769,14 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           ) : null}
           <div className="lyrics-settings-advanced-wrap__body">
 
-        {showVisualControls ? (
+        {variant === 'settings' ? (
+          <LyricsSettingsCategoryHeader
+            title={t('lyricsSettings.groups.presentation')}
+            description={t('lyricsSettings.groups.presentationDescription')}
+          />
+        ) : null}
+
+        {variant === 'drawer' && showVisualControls ? (
         <LyricsSettingsSection
           className="lyrics-mini-player-section"
           description={t('lyricsSettings.display.miniPlayerDescription')}
@@ -2188,37 +2788,106 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           <label className="audio-toggle-row">
             <span>
               <EyeOff size={17} />
-              <strong>{t('lyricsSettings.display.miniPlayer')}</strong>
+              <span className="lyrics-toggle-copy">
+                <strong>{t('lyricsSettings.display.miniPlayer')}</strong>
+                <small>{t('lyricsSettings.display.miniPlayerHint')}</small>
+              </span>
             </span>
             <input
               type="checkbox"
+              aria-label={t('lyricsSettings.display.miniPlayer')}
               checked={effectiveSettings.lyricsPlayerBarDrawerEnabled}
               disabled={isBusy}
               onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerEnabled: event.currentTarget.checked })}
             />
           </label>
-          <p>{t('lyricsSettings.display.miniPlayerDescription')}</p>
-          <p>{t('lyricsSettings.display.miniPlayerHint')}</p>
           <label className="audio-toggle-row">
             <span>
-              <EyeOff size={17} />
-              <strong>{t('lyricsSettings.display.miniPlayerAutoMv')}</strong>
+              <Keyboard size={17} />
+              <span className="lyrics-toggle-copy">
+                <strong>{t('lyricsSettings.display.miniPlayerShortcut')}</strong>
+                <small>{t('lyricsSettings.display.miniPlayerShortcutDescription')}</small>
+              </span>
             </span>
             <input
               type="checkbox"
+              aria-label={t('lyricsSettings.display.miniPlayerShortcut')}
+              checked={effectiveSettings.lyricsPlayerBarDrawerShortcutEnabled === true}
+              disabled={isBusy}
+              onChange={(event) => {
+                const enabled = event.currentTarget.checked;
+                if (!enabled) {
+                  setIsMiniPlayerShortcutRecording(false);
+                  setMiniPlayerShortcutMessage(null);
+                }
+                void patchSettings({ lyricsPlayerBarDrawerShortcutEnabled: enabled });
+              }}
+            />
+          </label>
+          {effectiveSettings.lyricsPlayerBarDrawerShortcutEnabled ? (
+            <div className="lyrics-mini-player-shortcut-control" role="group" aria-label={t('lyricsSettings.display.miniPlayerShortcut')}>
+              <button
+                className={`settings-shortcut-key ${isMiniPlayerShortcutRecording ? 'is-recording' : ''}`}
+                type="button"
+                aria-label={t('settings.shortcuts.action.record')}
+                disabled={isBusy}
+                title={t('settings.shortcuts.action.record')}
+                onClick={() => {
+                  setMiniPlayerShortcutMessage(null);
+                  setIsMiniPlayerShortcutRecording(true);
+                }}
+              >
+                {isMiniPlayerShortcutRecording
+                  ? t('settings.shortcuts.recording')
+                  : formatAcceleratorForDisplay(
+                      effectiveSettings.lyricsPlayerBarDrawerShortcutAccelerator,
+                      t('settings.shortcuts.empty'),
+                    )}
+              </button>
+              <button
+                className="lyrics-mini-player-shortcut-clear"
+                type="button"
+                aria-label={t('settings.shortcuts.action.clear')}
+                disabled={isBusy || !effectiveSettings.lyricsPlayerBarDrawerShortcutAccelerator}
+                title={t('settings.shortcuts.action.clear')}
+                onClick={() => {
+                  setIsMiniPlayerShortcutRecording(false);
+                  setMiniPlayerShortcutMessage(null);
+                  void patchSettings({ lyricsPlayerBarDrawerShortcutAccelerator: null });
+                }}
+              >
+                <X size={15} />
+              </button>
+              {miniPlayerShortcutMessage ? <small className="lyrics-mini-player-shortcut-error">{miniPlayerShortcutMessage}</small> : null}
+            </div>
+          ) : null}
+          <label className="audio-toggle-row">
+            <span>
+              <EyeOff size={17} />
+              <span className="lyrics-toggle-copy">
+                <strong>{t('lyricsSettings.display.miniPlayerAutoMv')}</strong>
+                <small>{t('lyricsSettings.display.miniPlayerAutoMvDescription')}</small>
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              aria-label={t('lyricsSettings.display.miniPlayerAutoMv')}
               checked={effectiveSettings.lyricsPlayerBarDrawerAutoEnableForMv !== false}
               disabled={isBusy}
               onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerAutoEnableForMv: event.currentTarget.checked })}
             />
           </label>
-          <p>{t('lyricsSettings.display.miniPlayerAutoMvDescription')}</p>
           <label className="audio-toggle-row">
             <span>
               <EyeOff size={17} />
-              <strong>{t('lyricsSettings.display.miniPlayerAutoHide')}</strong>
+              <span className="lyrics-toggle-copy">
+                <strong>{t('lyricsSettings.display.miniPlayerAutoHide')}</strong>
+                <small>{t('lyricsSettings.display.miniPlayerAutoHideDescription')}</small>
+              </span>
             </span>
             <input
               type="checkbox"
+              aria-label={t('lyricsSettings.display.miniPlayerAutoHide')}
               checked={effectiveSettings.lyricsPlayerBarDrawerAutoHideEnabled === true}
               disabled={
                 isBusy ||
@@ -2228,14 +2897,17 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
               onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerAutoHideEnabled: event.currentTarget.checked })}
             />
           </label>
-          <p>{t('lyricsSettings.display.miniPlayerAutoHideDescription')}</p>
           <label className="audio-toggle-row">
             <span>
               <EyeOff size={17} />
-              <strong>{t('lyricsSettings.display.miniPlayerCompactOnIdle')}</strong>
+              <span className="lyrics-toggle-copy">
+                <strong>{t('lyricsSettings.display.miniPlayerCompactOnIdle')}</strong>
+                <small>{t('lyricsSettings.display.miniPlayerCompactOnIdleDescription')}</small>
+              </span>
             </span>
             <input
               type="checkbox"
+              aria-label={t('lyricsSettings.display.miniPlayerCompactOnIdle')}
               checked={effectiveSettings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true}
               disabled={
                 isBusy ||
@@ -2245,7 +2917,6 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
               onChange={(event) => void patchSettings({ lyricsPlayerBarDrawerCompactOnIdleEnabled: event.currentTarget.checked })}
             />
           </label>
-          <p>{t('lyricsSettings.display.miniPlayerCompactOnIdleDescription')}</p>
 
           {effectiveSettings.lyricsPlayerBarDrawerEnabled ? (
             <div className="audio-drawer-mini-grid lyrics-mini-player-options">
@@ -2346,55 +3017,61 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           title={t('lyricsSettings.textStyle.title')}
         >
 
-          <label
-            className="audio-toggle-row"
-            id="settings-row-lyrics-romanization"
-            data-search-highlight={highlightedSettingId === 'settings-row-lyrics-romanization' ? 'true' : undefined}
-          >
-            <span>
-              <Captions size={17} />
-              <strong>{t('lyricsSettings.display.showRomanization')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsRomanizationEnabled}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsRomanizationEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.display.showRomanizationDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.showRomanizationDescription')}>
+            <label
+              className="audio-toggle-row"
+              id="settings-row-lyrics-romanization"
+              data-search-highlight={highlightedSettingId === 'settings-row-lyrics-romanization' ? 'true' : undefined}
+            >
+              <span>
+                <Captions size={17} />
+                <strong>{t('lyricsSettings.display.showRomanization')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsRomanizationEnabled}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsRomanizationEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.display.showRomanization')}>{t('lyricsSettings.display.showRomanizationDescription')}</SettingHelpTooltip>
+          </div>
 
-          <label className="audio-toggle-row">
-            <span>
-              <Captions size={17} />
-              <strong>{t('lyricsSettings.display.preferUtatenKana')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsUtatenKanaEnabled === true}
-              disabled={isBusy || !effectiveSettings.lyricsRomanizationEnabled || !effectiveSettings.lyricsNetworkEnabled}
-              onChange={(event) => void patchSettings({ lyricsUtatenKanaEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.display.preferUtatenKanaDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.preferUtatenKanaDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <Captions size={17} />
+                <strong>{t('lyricsSettings.display.preferUtatenKana')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsUtatenKanaEnabled === true}
+                disabled={isBusy || !effectiveSettings.lyricsRomanizationEnabled || !effectiveSettings.lyricsNetworkEnabled}
+                onChange={(event) => void patchSettings({ lyricsUtatenKanaEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.display.preferUtatenKana')}>{t('lyricsSettings.display.preferUtatenKanaDescription')}</SettingHelpTooltip>
+          </div>
 
-          <label
-            className="audio-toggle-row"
-            id="settings-row-lyrics-translation"
-            data-search-highlight={highlightedSettingId === 'settings-row-lyrics-translation' ? 'true' : undefined}
-          >
-            <span>
-              <Captions size={17} />
-              <strong>{t('lyricsSettings.display.showTranslation')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsTranslationEnabled}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsTranslationEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.display.showTranslationDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.showTranslationDescription')}>
+            <label
+              className="audio-toggle-row"
+              id="settings-row-lyrics-translation"
+              data-search-highlight={highlightedSettingId === 'settings-row-lyrics-translation' ? 'true' : undefined}
+            >
+              <span>
+                <Captions size={17} />
+                <strong>{t('lyricsSettings.display.showTranslation')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsTranslationEnabled}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsTranslationEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.display.showTranslation')}>{t('lyricsSettings.display.showTranslationDescription')}</SettingHelpTooltip>
+          </div>
 
           <div className="lyrics-word-highlight-settings">
             <label className="audio-toggle-row lyrics-word-highlight-toggle">
@@ -2612,6 +3289,19 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
             </div>
           ) : null}
 
+          <label className="audio-toggle-row lyrics-smart-readable-toggle">
+            <span>
+              <EyeOff size={17} />
+              <strong>{t('lyricsSettings.background.smartReadable')}</strong>
+            </span>
+            <input
+              type="checkbox"
+              checked={effectiveSettings.lyricsSmartReadableColorsEnabled === true}
+              disabled={isBusy}
+              onChange={(event) => void patchSettings({ lyricsSmartReadableColorsEnabled: event.currentTarget.checked })}
+            />
+          </label>
+
           {showLyricsPageStyleControls ? (
           <div
             className="lyrics-color-panel"
@@ -2715,19 +3405,23 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                 {isDesktopLyricsFontPanelOpen ? (
                   <div className="lyrics-desktop-font-panel-body">
                     <button
-                      className="lyrics-font-picker-button"
+                      className="lyrics-font-picker-button lyrics-desktop-font-preview"
                       type="button"
                       disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
                       onClick={() => openFontPicker('desktopLyrics')}
                     >
-                      <span style={{ fontFamily: `"${desktopLyricsFontFamily}", "Microsoft YaHei", var(--echo-font-family)` }}>
-                        {desktopLyricsFontFamily}
+                      <span className="lyrics-desktop-font-preview__sample" style={{ fontFamily: `"${desktopLyricsFontFamily}", "Microsoft YaHei", var(--echo-font-family)` }}>
+                        Aa 字体预览
                       </span>
-                      <em>{t('lyricsSettings.display.defaultMicrosoftYahei')}</em>
+                      <span className="lyrics-desktop-font-preview__copy">
+                        <strong>{desktopLyricsFontFamily}</strong>
+                        <small>{t('lyricsSettings.display.defaultMicrosoftYahei')}</small>
+                      </span>
+                      <ChevronDown size={16} aria-hidden="true" />
                     </button>
                     <div className="lyrics-font-actions">
                       <button
-                        className="audio-device-pill"
+                        className="audio-device-pill lyrics-desktop-font-action"
                         type="button"
                         disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
                         onClick={() => openFontPicker('desktopLyrics')}
@@ -2740,7 +3434,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                         <em>{t('lyricsSettings.action.fonts')}</em>
                       </button>
                       <button
-                        className="audio-device-pill"
+                        className="audio-device-pill lyrics-desktop-font-action"
                         type="button"
                         disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
                         onClick={() => void chooseFontFileForTarget('desktopLyrics')}
@@ -2753,7 +3447,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                         <em>{t('lyricsSettings.action.choose')}</em>
                       </button>
                       <button
-                        className="audio-device-pill"
+                        className="audio-device-pill lyrics-desktop-font-action"
                         type="button"
                         disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
                         onClick={() => {
@@ -2800,38 +3494,42 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
                   onChange={(event) => patchDesktopLyricsStyle({ desktopLyricsTranslationEnabled: event.currentTarget.checked })}
                 />
               </label>
-              <label className="audio-toggle-row lyrics-desktop-hide-empty-toggle">
-                <span>
-                  <EyeOff size={17} />
-                  <strong>{t('lyricsSettings.display.desktopHideWhenNoLyrics')}</strong>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={desktopLyricsHideWhenNoLyricsEnabled === true}
-                  disabled={isBusy}
-                  onChange={(event) => patchDesktopLyricsStyle({ desktopLyricsHideWhenNoLyricsEnabled: event.currentTarget.checked })}
-                />
-              </label>
-              <p>{t('lyricsSettings.display.desktopHideWhenNoLyricsDescription')}</p>
-              <div className="lyrics-color-panel__header">
-                <span>
-                  <Rows3 size={15} />
-                  <strong>{t('lyricsSettings.display.desktopTextDirection')}</strong>
-                </span>
-                <em>{t(desktopLyricsTextDirection === 'vertical' ? 'lyricsSettings.direction.vertical' : 'lyricsSettings.direction.horizontal')}</em>
+              <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.desktopHideWhenNoLyricsDescription')}>
+                <label className="audio-toggle-row lyrics-desktop-hide-empty-toggle">
+                  <span>
+                    <EyeOff size={17} />
+                    <strong>{t('lyricsSettings.display.desktopHideWhenNoLyrics')}</strong>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={desktopLyricsHideWhenNoLyricsEnabled === true}
+                    disabled={isBusy}
+                    onChange={(event) => patchDesktopLyricsStyle({ desktopLyricsHideWhenNoLyricsEnabled: event.currentTarget.checked })}
+                  />
+                </label>
+                <SettingHelpTooltip label={t('lyricsSettings.display.desktopHideWhenNoLyrics')}>{t('lyricsSettings.display.desktopHideWhenNoLyricsDescription')}</SettingHelpTooltip>
               </div>
-              <StyledSelect<'horizontal' | 'vertical'>
-                className="lyrics-desktop-direction-select"
-                ariaLabel={t('lyricsSettings.display.desktopTextDirection')}
-                value={desktopLyricsTextDirection}
-                options={[
-                  { value: 'horizontal', label: t('lyricsSettings.direction.horizontal') },
-                  { value: 'vertical', label: t('lyricsSettings.direction.vertical') },
-                ]}
-                disabled={isBusy}
-                showFilterIcon={false}
-                onChange={(direction) => patchDesktopLyricsStyle({ desktopLyricsTextDirection: direction })}
-              />
+              <div className="lyrics-desktop-direction-row">
+                <div className="lyrics-color-panel__header">
+                  <span>
+                    <Rows3 size={15} />
+                    <strong>{t('lyricsSettings.display.desktopTextDirection')}</strong>
+                  </span>
+                  <em>{t(desktopLyricsTextDirection === 'vertical' ? 'lyricsSettings.direction.vertical' : 'lyricsSettings.direction.horizontal')}</em>
+                </div>
+                <StyledSelect<'horizontal' | 'vertical'>
+                  className="lyrics-desktop-direction-select"
+                  ariaLabel={t('lyricsSettings.display.desktopTextDirection')}
+                  value={desktopLyricsTextDirection}
+                  options={[
+                    { value: 'horizontal', label: t('lyricsSettings.direction.horizontal') },
+                    { value: 'vertical', label: t('lyricsSettings.direction.vertical') },
+                  ]}
+                  disabled={isBusy}
+                  showFilterIcon={false}
+                  onChange={(direction) => patchDesktopLyricsStyle({ desktopLyricsTextDirection: direction })}
+                />
+              </div>
 
               <div className="lyrics-desktop-size-controls">
                 <label className="mv-threshold-control lyrics-desktop-primary-size-control">
@@ -2903,19 +3601,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
 
               {desktopLyricsVisible ? (
                 <>
-                  <label className="audio-toggle-row">
-                    <span>
-                      <Lock size={17} />
-                      <strong>{t('lyricsSettings.display.lockDesktopLyrics')}</strong>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={desktopLyricsLocked}
-                      disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
-                      onChange={(event) => setDesktopLyricsLocked(event.currentTarget.checked)}
-                    />
-                  </label>
-                  <p>{t('lyricsSettings.display.lockDesktopLyricsDescription')}</p>
+                  <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.display.lockDesktopLyricsDescription')}>
+                    <label className="audio-toggle-row">
+                      <span>
+                        <Lock size={17} />
+                        <strong>{t('lyricsSettings.display.lockDesktopLyrics')}</strong>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={desktopLyricsLocked}
+                        disabled={isBusy || isDesktopLyricsBusy || !hasDesktopLyricsBridge}
+                        onChange={(event) => setDesktopLyricsLocked(event.currentTarget.checked)}
+                      />
+                    </label>
+                    <SettingHelpTooltip label={t('lyricsSettings.display.lockDesktopLyrics')}>{t('lyricsSettings.display.lockDesktopLyricsDescription')}</SettingHelpTooltip>
+                  </div>
                   <button
                     className="audio-device-pill"
                     type="button"
@@ -2946,35 +3646,39 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           onToggle={() => setIsLyricsBackgroundSectionOpen((value) => !value)}
           title={t('lyricsSettings.background.title')}
         >
-          <label className="audio-toggle-row lyrics-immersive-cover-style-toggle">
-            <span>
-              <Captions size={17} />
-              <strong>{t('lyricsSettings.background.immersiveCoverStyle')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsImmersiveCoverStyleEnabled === true}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsImmersiveCoverStyleEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.background.immersiveCoverStyleDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.background.immersiveCoverStyleDescription')}>
+            <label className="audio-toggle-row lyrics-immersive-cover-style-toggle">
+              <span>
+                <Captions size={17} />
+                <strong>{t('lyricsSettings.background.immersiveCoverStyle')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsImmersiveCoverStyleEnabled === true}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsImmersiveCoverStyleEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.background.immersiveCoverStyle')}>{t('lyricsSettings.background.immersiveCoverStyleDescription')}</SettingHelpTooltip>
+          </div>
 
           {effectiveSettings.lyricsImmersiveCoverStyleEnabled ? (
             <div className="lyrics-immersive-glass-controls">
-              <label className="audio-toggle-row lyrics-immersive-cover-glass-toggle">
-                <span>
-                  <SlidersHorizontal size={17} />
-                  <strong>{t('lyricsSettings.background.immersiveCoverGlass')}</strong>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={effectiveSettings.lyricsImmersiveCoverGlassEnabled === true}
-                  disabled={isBusy}
-                  onChange={(event) => void patchSettings({ lyricsImmersiveCoverGlassEnabled: event.currentTarget.checked })}
-                />
-              </label>
-              <p>{t('lyricsSettings.background.immersiveCoverGlassDescription')}</p>
+              <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.background.immersiveCoverGlassDescription')}>
+                <label className="audio-toggle-row lyrics-immersive-cover-glass-toggle">
+                  <span>
+                    <SlidersHorizontal size={17} />
+                    <strong>{t('lyricsSettings.background.immersiveCoverGlass')}</strong>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={effectiveSettings.lyricsImmersiveCoverGlassEnabled === true}
+                    disabled={isBusy}
+                    onChange={(event) => void patchSettings({ lyricsImmersiveCoverGlassEnabled: event.currentTarget.checked })}
+                  />
+                </label>
+                <SettingHelpTooltip label={t('lyricsSettings.background.immersiveCoverGlass')}>{t('lyricsSettings.background.immersiveCoverGlassDescription')}</SettingHelpTooltip>
+              </div>
               {effectiveSettings.lyricsImmersiveCoverGlassEnabled ? (
                 <label className="lyrics-drawer-range lyrics-immersive-cover-glass-blur-range">
                   <span>
@@ -2996,44 +3700,34 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
 
           {musicReactiveVisualsFeatureEnabled ? (
             <>
-              <label className="audio-toggle-row lyrics-music-reactive-toggle">
-                <span>
-                  <Zap size={17} />
-                  <strong>{t('lyricsSettings.background.musicReactiveVisuals')}</strong>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={effectiveSettings.lyricsMusicReactiveVisualsEnabled === true}
-                  disabled={isBusy}
-                  onChange={(event) => void patchSettings({ lyricsMusicReactiveVisualsEnabled: event.currentTarget.checked })}
-                />
-              </label>
-              <p>{t('lyricsSettings.background.musicReactiveVisualsDescription')}</p>
+              <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.background.musicReactiveVisualsDescription')}>
+                <label className="audio-toggle-row lyrics-music-reactive-toggle">
+                  <span>
+                    <Zap size={17} />
+                    <strong>{t('lyricsSettings.background.musicReactiveVisuals')}</strong>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={effectiveSettings.lyricsMusicReactiveVisualsEnabled === true}
+                    disabled={isBusy}
+                    onChange={(event) => void patchSettings({ lyricsMusicReactiveVisualsEnabled: event.currentTarget.checked })}
+                  />
+                </label>
+                <SettingHelpTooltip label={t('lyricsSettings.background.musicReactiveVisuals')}>{t('lyricsSettings.background.musicReactiveVisualsDescription')}</SettingHelpTooltip>
+              </div>
             </>
           ) : null}
 
-          <label className="audio-toggle-row lyrics-smart-readable-toggle">
-            <span>
-              <EyeOff size={17} />
-              <strong>{t('lyricsSettings.background.smartReadable')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsSmartReadableColorsEnabled === true}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsSmartReadableColorsEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.background.smartReadableDescription')}</p>
-
-          <label className="audio-toggle-row lyrics-readability-toggle">
-            <span>
-              <EyeOff size={17} />
-              <strong>{t('lyricsSettings.background.readability')}</strong>
-            </span>
-            <input type="checkbox" checked={lyricsReadabilityEnhanced} onChange={toggleLyricsReadabilityEnhanced} />
-          </label>
-          <p>{t('lyricsSettings.background.readabilityDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.background.readabilityDescription')}>
+            <label className="audio-toggle-row lyrics-readability-toggle">
+              <span>
+                <EyeOff size={17} />
+                <strong>{t('lyricsSettings.background.readability')}</strong>
+              </span>
+              <input type="checkbox" checked={lyricsReadabilityEnhanced} onChange={toggleLyricsReadabilityEnhanced} />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.background.readability')}>{t('lyricsSettings.background.readabilityDescription')}</SettingHelpTooltip>
+          </div>
 
           <div className="audio-toggle-row lyrics-background-toggle lyrics-background-toggle--with-mode">
             <span>
@@ -3097,19 +3791,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           <div className="lyrics-background-controls" hidden={!isBackgroundControlsOpen}>
             <p>{t('lyricsSettings.background.modeDescription')}</p>
 
-            <label className="audio-toggle-row lyrics-background-network-cover-toggle">
-              <span>
-                <ImageIcon size={17} />
-                <strong>{t('lyricsSettings.background.highResolutionCover')}</strong>
-              </span>
-              <input
-                type="checkbox"
-                checked={effectiveSettings.lyricsHighResolutionNetworkCoverEnabled === true}
-                disabled={isBusy || effectiveSettings.lyricsBackgroundMode !== 'cover'}
-                onChange={(event) => void patchSettings({ lyricsHighResolutionNetworkCoverEnabled: event.currentTarget.checked })}
-              />
-            </label>
-            <p>{t('lyricsSettings.background.highResolutionCoverDescription')}</p>
+            <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.background.highResolutionCoverDescription')}>
+              <label className="audio-toggle-row lyrics-background-network-cover-toggle">
+                <span>
+                  <ImageIcon size={17} />
+                  <strong>{t('lyricsSettings.background.highResolutionCover')}</strong>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={effectiveSettings.lyricsHighResolutionNetworkCoverEnabled === true}
+                  disabled={isBusy || effectiveSettings.lyricsBackgroundMode !== 'cover'}
+                  onChange={(event) => void patchSettings({ lyricsHighResolutionNetworkCoverEnabled: event.currentTarget.checked })}
+                />
+              </label>
+              <SettingHelpTooltip label={t('lyricsSettings.background.highResolutionCover')}>{t('lyricsSettings.background.highResolutionCoverDescription')}</SettingHelpTooltip>
+            </div>
 
             <div className={`lyrics-cover-tuning${isBackgroundTuningOpen ? ' lyrics-cover-tuning--open' : ''}`}>
               <button
@@ -3222,40 +3918,52 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
         </LyricsSettingsSection>
         ) : null}
 
+        {variant === 'settings' ? (
+          <LyricsSettingsCategoryHeader
+            title={t('lyricsSettings.groups.sources')}
+            description={t('lyricsSettings.groups.sourcesDescription')}
+          />
+        ) : null}
+
         <LyricsSettingsSection
+          className="lyrics-online-section"
           description={t('lyricsSettings.online.description')}
           icon={<Globe2 size={17} />}
           isOpen={isLyricsOnlineSectionOpen}
           onToggle={() => setIsLyricsOnlineSectionOpen((value) => !value)}
           title={t('lyricsSettings.online.title')}
         >
-          <label className="audio-toggle-row">
-            <span>
-              <Globe2 size={17} />
-              <strong>{t('lyricsSettings.online.enable')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsNetworkEnabled}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsNetworkEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.online.enableDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.online.enableDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <Globe2 size={17} />
+                <strong>{t('lyricsSettings.online.enable')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsNetworkEnabled}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsNetworkEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.online.enable')}>{t('lyricsSettings.online.enableDescription')}</SettingHelpTooltip>
+          </div>
 
-          <label className="audio-toggle-row">
-            <span>
-              <Zap size={17} />
-              <strong>{t('lyricsSettings.online.deepSearch')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsDeepSearchEnabled}
-              disabled={isBusy || !effectiveSettings.lyricsNetworkEnabled}
-              onChange={(event) => void patchSettings({ lyricsDeepSearchEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.online.deepSearchDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.online.deepSearchDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <Zap size={17} />
+                <strong>{t('lyricsSettings.online.deepSearch')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsDeepSearchEnabled}
+                disabled={isBusy || !effectiveSettings.lyricsNetworkEnabled}
+                onChange={(event) => void patchSettings({ lyricsDeepSearchEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.online.deepSearch')}>{t('lyricsSettings.online.deepSearchDescription')}</SettingHelpTooltip>
+          </div>
 
           {showPersistentControls ? (
           <div className={`lyrics-source-panel${isLyricsSourcePanelOpen ? ' lyrics-source-panel--open' : ''}`}>
@@ -3337,37 +4045,42 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           </div>
           ) : null}
 
-          <label className="audio-toggle-row">
-            <span>
-              <Database size={17} />
-              <strong>{t('lyricsSettings.online.autoSearch')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsAutoSearch}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsAutoSearch: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.online.autoSearchDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.online.autoSearchDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <Database size={17} />
+                <strong>{t('lyricsSettings.online.autoSearch')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsAutoSearch}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsAutoSearch: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.online.autoSearch')}>{t('lyricsSettings.online.autoSearchDescription')}</SettingHelpTooltip>
+          </div>
 
-          <label className="audio-toggle-row">
-            <span>
-              <FolderOpen size={17} />
-              <strong>{t('lyricsSettings.online.autoSaveSidecar')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsAutoSaveSidecarEnabled === true}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsAutoSaveSidecarEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.online.autoSaveSidecarDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.online.autoSaveSidecarDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <FolderOpen size={17} />
+                <strong>{t('lyricsSettings.online.autoSaveSidecar')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsAutoSaveSidecarEnabled === true}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsAutoSaveSidecarEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.online.autoSaveSidecar')}>{t('lyricsSettings.online.autoSaveSidecarDescription')}</SettingHelpTooltip>
+          </div>
         </LyricsSettingsSection>
 
         {showPersistentControls ? (
         <LyricsSettingsSection
+          className="lyrics-timing-section"
           description={t('lyricsSettings.timing.description')}
           icon={<TimerReset size={17} />}
           isOpen={isLyricsTimingSectionOpen}
@@ -3406,19 +4119,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           </label>
           </div>
 
-          <label className="audio-toggle-row">
-            <span>
-              <TimerReset size={17} />
-              <strong>{t('lyricsSettings.timing.timelineCorrection')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsTimelineCorrectionEnabled !== false}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsTimelineCorrectionEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.timing.timelineCorrectionDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.timing.timelineCorrectionDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <TimerReset size={17} />
+                <strong>{t('lyricsSettings.timing.timelineCorrection')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsTimelineCorrectionEnabled !== false}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsTimelineCorrectionEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.timing.timelineCorrection')}>{t('lyricsSettings.timing.timelineCorrectionDescription')}</SettingHelpTooltip>
+          </div>
 
           <label className="audio-toggle-row">
             <span>
@@ -3433,19 +4148,21 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
             />
           </label>
 
-          <label className="audio-toggle-row">
-            <span>
-              <TimerReset size={17} />
-              <strong>{t('lyricsSettings.timing.smartAlignment')}</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={effectiveSettings.lyricsSmartAlignmentEnabled === true}
-              disabled={isBusy}
-              onChange={(event) => void patchSettings({ lyricsSmartAlignmentEnabled: event.currentTarget.checked })}
-            />
-          </label>
-          <p>{t('lyricsSettings.timing.smartAlignmentDescription')}</p>
+          <div className="lyrics-setting-with-help" data-drawer-search-item="" data-search-keywords={t('lyricsSettings.timing.smartAlignmentDescription')}>
+            <label className="audio-toggle-row">
+              <span>
+                <TimerReset size={17} />
+                <strong>{t('lyricsSettings.timing.smartAlignment')}</strong>
+              </span>
+              <input
+                type="checkbox"
+                checked={effectiveSettings.lyricsSmartAlignmentEnabled === true}
+                disabled={isBusy}
+                onChange={(event) => void patchSettings({ lyricsSmartAlignmentEnabled: event.currentTarget.checked })}
+              />
+            </label>
+            <SettingHelpTooltip label={t('lyricsSettings.timing.smartAlignment')}>{t('lyricsSettings.timing.smartAlignmentDescription')}</SettingHelpTooltip>
+          </div>
 
           {showCurrentTrackTools && currentTrackTools ? (
             <div className="lyrics-current-track-tools-panel">
@@ -3457,7 +4174,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
             className="audio-device-pill"
             type="button"
             disabled={isBusy}
-            onClick={() => void patchSettings({ lyricsAutoAcceptScore: 0.5, lyricsDefaultOffsetMs: 0, lyricsGlobalSyncOffsetMs: 0 })}
+            onClick={() => void patchSettings({ lyricsAutoAcceptScore: 0.78, lyricsDefaultOffsetMs: 0, lyricsGlobalSyncOffsetMs: 0 })}
           >
             <RotateCcw size={15} />
             <span>
@@ -3472,7 +4189,7 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
           </div>
         </div>
 
-        {isFontPickerOpen ? (
+      {isFontPickerOpen ? (
           <LyricsFontPickerModal
             currentFont={fontPickerTarget === 'desktopLyrics' ? desktopLyricsFontFamily : lyricsFontFamily}
             fonts={fontFamilies}
@@ -3490,19 +4207,37 @@ export const LyricsSettingsPanel = ({ className, currentTrackTools, highlightedS
   );
 };
 
+export const LyricsSettingsPanel = memo(LyricsSettingsPanelComponent);
+
 export const LyricsSettingsDrawer = ({ currentTrackTools, isOpen, onClose }: LyricsSettingsDrawerProps): JSX.Element | null => {
   const t = useOptionalI18n()?.t ?? translateFallback;
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
-  const [shouldRender, setShouldRender] = useState(isOpen);
   const [isMotionOpen, setIsMotionOpen] = useState(false);
+  const [isPanelMounted, setIsPanelMounted] = useState(() => !('requestIdleCallback' in window));
+  const [activeCategory, setActiveCategory] = useState<LyricsSettingsCategory>('display');
   const drawerSearchHints = useMemo(
     () => ['歌词源', '桌面歌词', '逐字', '罗马音', '偏移', '字体'],
     [],
   );
 
+  useLayoutEffect(() => {
+    const panel = drawerScrollRef.current?.querySelector<HTMLElement>('.lyrics-settings-panel');
+    if (panel) {
+      panel.dataset.category = activeCategory;
+    }
+  }, [activeCategory, isOpen, isPanelMounted]);
+
+  useEffect(() => {
+    if (!isOpen || isPanelMounted) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => setIsPanelMounted(true), lyricsSettingsPanelMountDelayMs);
+    return () => window.clearTimeout(timer);
+  }, [isOpen, isPanelMounted]);
+
   useEffect(() => {
     if (isOpen) {
-      setShouldRender(true);
       let secondFrame = 0;
       const firstFrame = window.requestAnimationFrame(() => {
         secondFrame = window.requestAnimationFrame(() => setIsMotionOpen(true));
@@ -3514,13 +4249,8 @@ export const LyricsSettingsDrawer = ({ currentTrackTools, isOpen, onClose }: Lyr
     }
 
     setIsMotionOpen(false);
-    if (!shouldRender) {
-      return undefined;
-    }
-
-    const timer = window.setTimeout(() => setShouldRender(false), drawerExitAnimationMs);
-    return () => window.clearTimeout(timer);
-  }, [isOpen, shouldRender]);
+    return undefined;
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -3538,12 +4268,23 @@ export const LyricsSettingsDrawer = ({ currentTrackTools, isOpen, onClose }: Lyr
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  if (!shouldRender) {
-    return null;
-  }
+  useEffect(() => {
+    if (isOpen) {
+      const scrollRoot = drawerScrollRef.current;
+      if (scrollRoot) {
+        scrollRoot.scrollTop = 0;
+      }
+    }
+  }, [isOpen]);
 
   return (
-    <div className="audio-drawer-root lyrics-settings-drawer-root no-drag" role="presentation" data-open={isMotionOpen}>
+    <div
+      className="audio-drawer-root lyrics-settings-drawer-root no-drag"
+      role="presentation"
+      data-open={isMotionOpen}
+      aria-hidden={!isOpen}
+      {...(!isOpen ? { inert: '' } : {})}
+    >
       <button className="audio-drawer-scrim" type="button" aria-label={t('lyricsSettings.drawer.close')} onClick={onClose} />
       <aside className="audio-drawer lyrics-settings-drawer" aria-label={t('lyricsSettings.drawer.aria')}>
         <div className="audio-drawer-scroll" ref={drawerScrollRef}>
@@ -3558,6 +4299,7 @@ export const LyricsSettingsDrawer = ({ currentTrackTools, isOpen, onClose }: Lyr
           </header>
           <DrawerSmartSearch
             rootRef={drawerScrollRef}
+            enabled={isOpen}
             label={t('drawerSearch.label')}
             placeholder={t('drawerSearch.placeholder')}
             clearLabel={t('drawerSearch.clear')}
@@ -3569,8 +4311,56 @@ export const LyricsSettingsDrawer = ({ currentTrackTools, isOpen, onClose }: Lyr
             shortcutHint={t('drawerSearch.shortcutHint')}
             hints={drawerSearchHints}
           />
-          <LyricsSettingsPanel currentTrackTools={currentTrackTools} />
+          <nav className="lyrics-settings-category-tabs" aria-label="歌词设置分类">
+            {([
+              ['match', '匹配'],
+              ['display', '显示'],
+              ['desktop', '桌面'],
+              ['advanced', '高级'],
+            ] as const).map(([category, label]) => (
+              <button
+                key={category}
+                type="button"
+                aria-current={activeCategory === category ? 'page' : undefined}
+                data-active={activeCategory === category}
+                onClick={() => {
+                  const panel = drawerScrollRef.current?.querySelector<HTMLElement>('.lyrics-settings-panel');
+                  if (panel) {
+                    panel.dataset.category = category;
+                  }
+                  setActiveCategory(category);
+                  const scrollRoot = drawerScrollRef.current;
+                  if (scrollRoot) {
+                    scrollRoot.scrollTop = 0;
+                  }
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+          {isPanelMounted ? (
+            <LyricsSettingsPanel
+              activeCategory="display"
+              currentTrackTools={currentTrackTools}
+              isActive={isOpen}
+            />
+          ) : (
+            <div className="lyrics-settings-panel-placeholder" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+          )}
         </div>
+        <footer className="lyrics-settings-drawer-footer">
+          <button type="button" onClick={() => window.dispatchEvent(new Event('lyrics-settings:reset'))}>
+            {t('lyricsSettings.action.reset')}
+          </button>
+          <button className="lyrics-settings-drawer-footer__done" type="button" onClick={onClose}>
+            完成
+          </button>
+        </footer>
       </aside>
     </div>
   );

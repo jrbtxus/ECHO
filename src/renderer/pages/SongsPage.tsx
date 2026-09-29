@@ -1,5 +1,6 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, Download, FilePlus2, FolderPlus, ListFilter, Loader2, Play, Radio, RotateCw, Search, Trash2, X } from 'lucide-react';
+import { useTrackViewportPaging, type TrackViewportLoadMode, type TrackViewportRange } from '../hooks/useTrackViewportPaging';
+import { Fragment, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowUpDown, Check, ChevronDown, Download, FilePlus2, FolderPlus, ListFilter, Loader2, Play, Radio, RotateCw, Search, Trash2, X } from 'lucide-react';
 import type { DuplicateTrackIndexSummary, DuplicateTrackMember, EditableTrackTags, LibraryAudioFormatFilter, LibraryPlaylist, LibraryScanStatus, LibrarySort, LibraryTrack } from '../../shared/types/library';
 import type { RemoteSource } from '../../shared/types/remoteSources';
 import type { StreamingProviderDescriptor, StreamingProviderName, StreamingSearchResult, StreamingTrack } from '../../shared/types/streaming';
@@ -25,7 +26,7 @@ import {
   type SongsFirstPageSnapshot,
 } from '../stores/songsFirstPageSnapshot';
 import { isPlaybackCancellationError, type QueueSource, usePlaybackQueue } from '../stores/PlaybackQueueProvider';
-import { useSharedPlaybackStatus } from '../stores/playbackStatusStore';
+import { useSharedPlaybackActivityState } from '../stores/playbackStatusStore';
 import { openAlbumDetailForTrack } from '../utils/albumNavigation';
 import { openArtistDetailForTrack } from '../utils/artistNavigation';
 import { resolvePlaylistForTrackAdd } from '../utils/appPrompt';
@@ -44,7 +45,6 @@ import { streamingTrackToLibraryTrack } from '../utils/streamingTrack';
 import { formatUserFacingError } from '../utils/userFacingError';
 
 const pageSize = 100;
-const maxPreservedRefreshPageSize = 500;
 const preserveScrollThresholdPx = 80;
 const remoteSourcePlaybackRefreshDelayMs = 4000;
 const sortMenuCloseAnimationMs = 120;
@@ -57,25 +57,55 @@ const dispatchLibraryChangedPreservingScroll = (): void => {
 };
 const isRemoteSourceRefreshPlaybackBusy = (state: string | null | undefined): boolean =>
   state === 'loading' || state === 'playing';
-const sortOptions: Array<{ value: LibrarySort; labelKey: TranslationKey }> = [
-  { value: 'default', labelKey: 'songs.sort.default' },
-  { value: 'createdAsc', labelKey: 'songs.sort.createdAsc' },
-  { value: 'createdDesc', labelKey: 'songs.sort.createdDesc' },
-  { value: 'titleAsc', labelKey: 'songs.sort.titleAsc' },
-  { value: 'titleDesc', labelKey: 'songs.sort.titleDesc' },
-  { value: 'durationAsc', labelKey: 'songs.sort.durationAsc' },
-  { value: 'durationDesc', labelKey: 'songs.sort.durationDesc' },
-  { value: 'fileModifiedAsc', labelKey: 'songs.sort.fileModifiedAsc' },
-  { value: 'fileModifiedDesc', labelKey: 'songs.sort.fileModifiedDesc' },
-  { value: 'qualityAsc', labelKey: 'songs.sort.qualityAsc' },
-  { value: 'qualityDesc', labelKey: 'songs.sort.qualityDesc' },
-  { value: 'frequent', labelKey: 'songs.sort.frequent' },
-  { value: 'random', labelKey: 'songs.sort.random' },
-  { value: 'artist', labelKey: 'songs.sort.artist' },
-  { value: 'artistAlbum', labelKey: 'songs.sort.artistAlbum' },
-  { value: 'album', labelKey: 'songs.sort.album' },
-  { value: 'recent', labelKey: 'songs.sort.recent' },
+type SongSortOption = { value: LibrarySort; labelKey: TranslationKey };
+const sortGroups: Array<{ labelKey: TranslationKey; options: SongSortOption[] }> = [
+  {
+    labelKey: 'songs.sort.group.browse',
+    options: [
+      { value: 'default', labelKey: 'songs.sort.default' },
+      { value: 'titleAsc', labelKey: 'songs.sort.titleAsc' },
+      { value: 'titleDesc', labelKey: 'songs.sort.titleDesc' },
+      { value: 'artist', labelKey: 'songs.sort.artist' },
+      { value: 'artistAlbum', labelKey: 'songs.sort.artistAlbum' },
+      { value: 'album', labelKey: 'songs.sort.album' },
+      { value: 'yearDesc', labelKey: 'songs.sort.yearDesc' },
+      { value: 'yearAsc', labelKey: 'songs.sort.yearAsc' },
+    ],
+  },
+  {
+    labelKey: 'songs.sort.group.listening',
+    options: [
+      { value: 'lastPlayed', labelKey: 'songs.sort.lastPlayed' },
+      { value: 'playCountDesc', labelKey: 'songs.sort.playCountDesc' },
+      { value: 'playCountAsc', labelKey: 'songs.sort.playCountAsc' },
+      { value: 'bpmAsc', labelKey: 'songs.sort.bpmAsc' },
+      { value: 'bpmDesc', labelKey: 'songs.sort.bpmDesc' },
+      { value: 'random', labelKey: 'songs.sort.random' },
+    ],
+  },
+  {
+    labelKey: 'songs.sort.group.audio',
+    options: [
+      { value: 'audioSpecDesc', labelKey: 'songs.sort.audioSpecDesc' },
+      { value: 'audioSpecAsc', labelKey: 'songs.sort.audioSpecAsc' },
+      { value: 'qualityDesc', labelKey: 'songs.sort.qualityDesc' },
+      { value: 'qualityAsc', labelKey: 'songs.sort.qualityAsc' },
+      { value: 'durationAsc', labelKey: 'songs.sort.durationAsc' },
+      { value: 'durationDesc', labelKey: 'songs.sort.durationDesc' },
+    ],
+  },
+  {
+    labelKey: 'songs.sort.group.library',
+    options: [
+      { value: 'createdDesc', labelKey: 'songs.sort.createdDesc' },
+      { value: 'createdAsc', labelKey: 'songs.sort.createdAsc' },
+      { value: 'recent', labelKey: 'songs.sort.recent' },
+      { value: 'fileModifiedDesc', labelKey: 'songs.sort.fileModifiedDesc' },
+      { value: 'fileModifiedAsc', labelKey: 'songs.sort.fileModifiedAsc' },
+    ],
+  },
 ];
+const sortOptions = sortGroups.flatMap((group) => group.options);
 
 const audioFormatFilterOptions: Array<{ value: LibraryAudioFormatFilter; labelKey: TranslationKey }> = [
   { value: 'all', labelKey: 'songs.filter.audioFormat.all' },
@@ -95,6 +125,7 @@ const songsSortStorageKey = 'echo-next.songs.sort';
 const songsHideDuplicatesStorageKey = 'echo-next.songs.hide-duplicates';
 const songsOsuHiFiModeStorageKey = 'echo-next.songs.osu-hifi-mode';
 const validSortValues = new Set<LibrarySort>(sortOptions.map((option) => option.value));
+const normalizeSongSortValue = (value: LibrarySort): LibrarySort => value === 'frequent' ? 'playCountDesc' : value;
 const scanPollIntervalMs = 500;
 const finishedScanStatuses = new Set<LibraryScanStatus['status']>(['completed', 'cancelled', 'failed']);
 const osuHiFiSearchPageSize = 20;
@@ -117,7 +148,8 @@ const scanPhaseLabelKeys: Record<LibraryScanStatus['phase'], TranslationKey> = {
 const readStoredSort = (): LibrarySort => {
   try {
     const stored = window.localStorage.getItem(songsSortStorageKey);
-    return stored && validSortValues.has(stored as LibrarySort) ? (stored as LibrarySort) : 'default';
+    const normalized = normalizeSongSortValue((stored ?? 'default') as LibrarySort);
+    return validSortValues.has(normalized) ? normalized : 'default';
   } catch {
     return 'default';
   }
@@ -199,12 +231,34 @@ const isOsuHiFiPlayableTarget = (track: LibraryTrack): boolean =>
   track.unavailable !== true && track.mediaType !== 'streaming';
 
 const getOsuBeatmapsetId = (track: LibraryTrack): string | null => {
+  const taggedKey = Object.keys(track.fieldSources ?? {}).find((key) => /^osuBeatmapsetId:\d+$/u.test(key));
+  if (taggedKey) {
+    return taggedKey.slice(taggedKey.indexOf(':') + 1);
+  }
   const text = [track.album, track.path, track.stableKey].filter(Boolean).join('\n');
   return /\bosu!\s+beatmapset\s+(\d+)\b/iu.exec(text)?.[1] ?? null;
 };
 
+const getOsuBeatmapId = (track: LibraryTrack): string | null => {
+  const taggedKey = Object.keys(track.fieldSources ?? {}).find((key) => /^osuBeatmapId:\d+$/u.test(key));
+  return taggedKey ? taggedKey.slice(taggedKey.indexOf(':') + 1) : null;
+};
+
 const osuBeatmapsetUrl = (track: LibraryTrack): string | null => {
+  const beatmapId = getOsuBeatmapId(track);
+  if (beatmapId) {
+    return `https://osu.ppy.sh/beatmaps/${beatmapId}`;
+  }
   const beatmapsetId = getOsuBeatmapsetId(track);
+  return beatmapsetId ? `https://osu.ppy.sh/beatmapsets/${beatmapsetId}` : null;
+};
+
+const osuUrlFromComment = (comment: string | null | undefined): string | null => {
+  const beatmapId = comment?.match(/\bbeatmap id:\s*(\d+)\b/iu)?.[1];
+  if (beatmapId) {
+    return `https://osu.ppy.sh/beatmaps/${beatmapId}`;
+  }
+  const beatmapsetId = comment?.match(/\bbeatmapset id:\s*(\d+)\b/iu)?.[1];
   return beatmapsetId ? `https://osu.ppy.sh/beatmapsets/${beatmapsetId}` : null;
 };
 
@@ -376,6 +430,12 @@ export const SongsPage = (): JSX.Element => {
   const [duplicateHiddenCounts, setDuplicateHiddenCounts] = useState<Record<string, number>>({});
   const [likedTrackIds, setLikedTrackIds] = useState<Record<string, boolean>>({});
   const [selectedTrackIds, setSelectedTrackIds] = useState<Record<string, boolean>>({});
+  const pendingLibraryRefreshRef = useRef<boolean | null>(null);
+  const libraryRefreshTimerRef = useRef<number | null>(null);
+  const refreshLibraryRef = useRef<((preserveScroll: boolean) => void) | null>(null);
+  const visibleViewportRef = useRef<TrackViewportRange | null>(null);
+  const knownCurrentTrackPositionRef = useRef<{ queryKey: string; trackId: string; index: number } | null>(null);
+  const selectedTrackSnapshotsRef = useRef(new Map<string, { track: LibraryTrack; index: number }>());
   const [visibleTrackIds, setVisibleTrackIds] = useState<string[]>([]);
   const [likedRefreshVersion, setLikedRefreshVersion] = useState(0);
   const [versionMembers, setVersionMembers] = useState<DuplicateTrackMember[]>([]);
@@ -387,6 +447,7 @@ export const SongsPage = (): JSX.Element => {
   const [error, setError] = useState<string | null>(null);
   const [isOsuHiFiResolving, setIsOsuHiFiResolving] = useState(false);
   const [databaseRecoveryAvailable, setDatabaseRecoveryAvailable] = useState(false);
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [isSortOpen, setIsSortOpen] = useState(false);
   const [isSortClosing, setIsSortClosing] = useState(false);
   const [trackMenu, setTrackMenu] = useState<TrackMenuState | null>(null);
@@ -407,12 +468,11 @@ export const SongsPage = (): JSX.Element => {
   const ignoreNextLibraryChangedRef = useRef(false);
   const tagEditorCloseTimerRef = useRef<number | null>(null);
   const sortMenuCloseTimerRef = useRef<number | null>(null);
+  const filterMenuRef = useRef<HTMLDivElement | null>(null);
   const sortMenuRef = useRef<HTMLDivElement | null>(null);
   const { currentTrackId, playTrack, appendToQueue, appendTracksToQueue, playTrackNext, removeTrackFromQueue } = usePlaybackQueue();
-  const playbackStatusSnapshot = useSharedPlaybackStatus();
-  const remoteSourceRefreshPlaybackBusy = isRemoteSourceRefreshPlaybackBusy(
-    playbackStatusSnapshot.audioStatus?.state ?? playbackStatusSnapshot.playbackStatus?.state,
-  );
+  const playbackActivityState = useSharedPlaybackActivityState();
+  const remoteSourceRefreshPlaybackBusy = isRemoteSourceRefreshPlaybackBusy(playbackActivityState);
   const visibleTrackIdsKey = useMemo(() => visibleTrackIds.join('\0'), [visibleTrackIds]);
   const loadedTrackIdsKey = useMemo(() => uniqueIds(tracks.map((track) => track.id)).join('\0'), [tracks]);
   const activeSortLabel = t(sortOptions.find((option) => option.value === sort)?.labelKey ?? 'songs.sort.default');
@@ -431,7 +491,8 @@ export const SongsPage = (): JSX.Element => {
     return labels;
   }, [activeAudioFormatFilterLabel, audioFormatFilter, showDuplicatesOnly, showOsuOnly, t]);
   const activeFilterCount = activeFilterLabels.length;
-  const sortButtonTitle = activeFilterCount > 0 ? `${activeSortLabel} · ${activeFilterLabels.join(' / ')}` : activeSortLabel;
+  const filterButtonLabel = t('songs.filter.button');
+  const filterButtonTitle = activeFilterCount > 0 ? `${filterButtonLabel} · ${activeFilterLabels.join(' / ')}` : filterButtonLabel;
   const effectiveHideDuplicates = showDuplicatesOnly ? false : hideDuplicates;
   const osuHiFiModeActive = showOsuOnly && osuHiFiModeEnabled;
   const hasRemoteSources = remoteSources.length > 0;
@@ -463,7 +524,19 @@ export const SongsPage = (): JSX.Element => {
     setError(value instanceof Error ? value.message : String(value));
     setDatabaseRecoveryAvailable(false);
   }, []);
-  const selectedTracks = useMemo(() => tracks.filter((track) => selectedTrackIds[track.id] === true), [selectedTrackIds, tracks]);
+  const selectedTracks = useMemo(() => {
+    const snapshots = new Map(selectedTrackSnapshotsRef.current);
+    tracks.forEach((track, index) => {
+      if (selectedTrackIds[track.id]) snapshots.set(track.id, { track, index: loadedStartIndex + index });
+    });
+    return [...snapshots.values()].filter(({ track }) => selectedTrackIds[track.id])
+      .sort((left, right) => left.index - right.index).map(({ track }) => track);
+  }, [loadedStartIndex, selectedTrackIds, tracks]);
+  useEffect(() => {
+    for (const id of selectedTrackSnapshotsRef.current.keys()) {
+      if (!selectedTrackIds[id]) selectedTrackSnapshotsRef.current.delete(id);
+    }
+  }, [selectedTrackIds]);
   const mergeLikedTrackIds = useCallback((patch: Record<string, boolean>): void => {
     setLikedTrackIds((current) => {
       const next = { ...current, ...patch };
@@ -494,6 +567,7 @@ export const SongsPage = (): JSX.Element => {
 
   const openSortMenu = useCallback((): void => {
     clearSortMenuCloseTimer();
+    setIsFilterOpen(false);
     setIsSortClosing(false);
     setIsSortOpen(true);
   }, [clearSortMenuCloseTimer]);
@@ -520,6 +594,17 @@ export const SongsPage = (): JSX.Element => {
 
     openSortMenu();
   }, [closeSortMenu, isSortClosing, isSortOpen, openSortMenu]);
+
+  const closeFilterMenu = useCallback((): void => {
+    setIsFilterOpen(false);
+  }, []);
+
+  const toggleFilterMenu = useCallback((): void => {
+    clearSortMenuCloseTimer();
+    setIsSortOpen(false);
+    setIsSortClosing(false);
+    setIsFilterOpen((current) => !current);
+  }, [clearSortMenuCloseTimer]);
 
   const handleToggleOsuHiFiMode = useCallback((): void => {
     const nextEnabled = !osuHiFiModeEnabled;
@@ -662,7 +747,9 @@ export const SongsPage = (): JSX.Element => {
         }
 
         const localSort = readStoredSort();
-        const nextSort = (settings.appMemoryVersion ?? 0) < 1 && localSort !== 'default' ? localSort : (settings.songsSort ?? 'default');
+        const nextSort = normalizeSongSortValue(
+          (settings.appMemoryVersion ?? 0) < 1 && localSort !== 'default' ? localSort : (settings.songsSort ?? 'default'),
+        );
 
         if (validSortValues.has(nextSort)) {
           setSort(nextSort);
@@ -691,12 +778,27 @@ export const SongsPage = (): JSX.Element => {
     return () => window.removeEventListener('pointerdown', handlePointerDown);
   }, [closeSortMenu, isSortClosing, isSortOpen]);
 
+  useEffect(() => {
+    if (!isFilterOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event: MouseEvent): void => {
+      if (!filterMenuRef.current?.contains(event.target as Node)) {
+        closeFilterMenu();
+      }
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => window.removeEventListener('pointerdown', handlePointerDown);
+  }, [closeFilterMenu, isFilterOpen]);
+
   useEffect(() => () => clearSortMenuCloseTimer(), [clearSortMenuCloseTimer]);
 
   const handleToggleDuplicateFilter = useCallback((): void => {
     const nextShowDuplicatesOnly = !showDuplicatesOnly;
     setShowDuplicatesOnly(nextShowDuplicatesOnly);
-    closeSortMenu();
+    closeFilterMenu();
     setSelectedTrackIds({});
     clearSongsFirstPageSnapshot();
     clearListMetadataCache();
@@ -710,12 +812,12 @@ export const SongsPage = (): JSX.Element => {
 
       void window.echo?.library?.getDuplicateIndexSummary('strict').then(setDuplicateSummary).catch(() => undefined);
     }
-  }, [clearListMetadataCache, closeSortMenu, showDuplicatesOnly, sourceMode]);
+  }, [clearListMetadataCache, closeFilterMenu, showDuplicatesOnly, sourceMode]);
 
   const handleToggleOsuFilter = useCallback((): void => {
     const nextShowOsuOnly = !showOsuOnly;
     setShowOsuOnly(nextShowOsuOnly);
-    closeSortMenu();
+    closeFilterMenu();
     setSelectedTrackIds({});
     clearSongsFirstPageSnapshot();
     clearListMetadataCache();
@@ -728,24 +830,24 @@ export const SongsPage = (): JSX.Element => {
       setRemoteSourceId(null);
       setShowDuplicatesOnly(false);
     }
-  }, [clearListMetadataCache, closeSortMenu, showOsuOnly, sourceMode]);
+  }, [clearListMetadataCache, closeFilterMenu, showOsuOnly, sourceMode]);
 
   const handleAudioFormatFilterChange = useCallback(
     (nextAudioFormatFilter: LibraryAudioFormatFilter): void => {
       setAudioFormatFilter(nextAudioFormatFilter);
-      closeSortMenu();
+      closeFilterMenu();
       setSelectedTrackIds({});
       clearSongsFirstPageSnapshot();
       clearListMetadataCache();
     },
-    [clearListMetadataCache, closeSortMenu],
+    [clearListMetadataCache, closeFilterMenu],
   );
 
   const loadTracks = useCallback(
     async (
       nextPage: number,
       mode: 'replace' | 'append' | 'prepend',
-      options: { pageSizeOverride?: number; preserveListInstance?: boolean; restoreScrollTop?: number } = {},
+      options: { pageSizeOverride?: number; preserveListInstance?: boolean; restoreScrollTop?: number; additionalPages?: number } = {},
     ) => {
       if (mode !== 'replace' && isLoadingRef.current) {
         return;
@@ -796,6 +898,13 @@ export const SongsPage = (): JSX.Element => {
         const shouldUseFirstPageSnapshot = mode === 'replace' && nextPage === 1 && canUseSongsFirstPageSnapshot(query);
         const queryStartedAt = performance.now();
         const result = await library.getTracks(query);
+        if (options.additionalPages && result.hasMore) {
+          const following = await Promise.all(Array.from({ length: options.additionalPages }, (_, index) =>
+            library.getTracks({ ...query, page: nextPage + index + 1 })));
+          result.items = [...result.items, ...following.flatMap((page) => page.items)];
+          result.hasMore = following.at(-1)?.hasMore ?? result.hasMore;
+          result.total = following.at(-1)?.total ?? result.total;
+        }
         const queryMs = performance.now() - queryStartedAt;
 
         if (requestIdRef.current !== requestId) {
@@ -848,10 +957,18 @@ export const SongsPage = (): JSX.Element => {
         if (requestIdRef.current === requestId) {
           isLoadingRef.current = false;
           setIsLoading(false);
+          if (pendingLibraryRefreshRef.current !== null && libraryRefreshTimerRef.current === null) {
+            libraryRefreshTimerRef.current = window.setTimeout(() => {
+              libraryRefreshTimerRef.current = null;
+              const preserve = pendingLibraryRefreshRef.current;
+              pendingLibraryRefreshRef.current = null;
+              if (preserve !== null) refreshLibraryRef.current?.(preserve);
+            }, 0);
+          }
         }
       }
     },
-    [audioFormatFilter, clearListMetadataCache, effectiveHideDuplicates, remoteSourceId, reportSongsError, search, showDuplicatesOnly, showOsuOnly, sort, sourceMode],
+    [audioFormatFilter, clearListMetadataCache, effectiveHideDuplicates, remoteSourceId, reportSongsError, search, showDuplicatesOnly, showOsuOnly, sort, sourceMode, t],
   );
 
   useEffect(() => {
@@ -860,11 +977,14 @@ export const SongsPage = (): JSX.Element => {
     }
 
     void loadTracks(1, 'replace');
-  }, [loadTracks, sourceLoadGate, sourceMode]);
+  }, [hasRemoteSources, loadTracks, remoteSourcesLoaded, sourceLoadGate, sourceMode]);
 
   useEffect(() => {
     return () => {
       clearVisibleRemoteHydrationTimers();
+      if (libraryRefreshTimerRef.current !== null) window.clearTimeout(libraryRefreshTimerRef.current);
+      pendingLibraryRefreshRef.current = null;
+      refreshLibraryRef.current = null;
     };
   }, [clearVisibleRemoteHydrationTimers]);
 
@@ -909,7 +1029,11 @@ export const SongsPage = (): JSX.Element => {
   }, [loadDuplicateSettings]);
 
   useEffect(() => {
-    const handleLibraryChanged = (event: Event): void => {
+    const refresh = (preserveScroll: boolean): void => {
+      if (isLoadingRef.current) {
+        pendingLibraryRefreshRef.current = (pendingLibraryRefreshRef.current ?? false) || preserveScroll;
+        return;
+      }
       if (ignoreNextLibraryChangedRef.current) {
         ignoreNextLibraryChangedRef.current = false;
         clearSongsFirstPageSnapshot();
@@ -917,13 +1041,18 @@ export const SongsPage = (): JSX.Element => {
       }
 
       const scrollTop = readSongsScrollTop();
-      if (isPreserveScrollLibraryEvent(event) && scrollTop > preserveScrollThresholdPx) {
+      if (preserveScroll && scrollTop > preserveScrollThresholdPx) {
         clearSongsFirstPageSnapshot();
         clearListMetadataCache();
-        void loadTracks(1, 'replace', {
-          pageSizeOverride: Math.min(maxPreservedRefreshPageSize, Math.max(pageSize, tracks.length)),
+        const scrollElement = getSongsScrollElement();
+        const rowHeight = Number(scrollElement?.dataset.estimatedRowHeight) || 76;
+        const firstIndex = visibleViewportRef.current?.firstIndex ?? Math.floor(scrollTop / rowHeight);
+        const lastIndex = visibleViewportRef.current?.lastIndex ?? firstIndex;
+        const firstPage = Math.floor(firstIndex / pageSize) + 1;
+        const lastPage = Math.floor(lastIndex / pageSize) + 1;
+        void loadTracks(firstPage, 'replace', {
+          additionalPages: Math.min(2, Math.max(0, lastPage - firstPage)),
           preserveListInstance: true,
-          restoreScrollTop: scrollTop,
         });
         return;
       }
@@ -933,6 +1062,8 @@ export const SongsPage = (): JSX.Element => {
       void loadTracks(1, 'replace');
     };
 
+    refreshLibraryRef.current = refresh;
+    const handleLibraryChanged = (event: Event): void => refresh(isPreserveScrollLibraryEvent(event));
     window.addEventListener('library:changed', handleLibraryChanged);
     return () => window.removeEventListener('library:changed', handleLibraryChanged);
   }, [clearListMetadataCache, loadTracks, tracks.length]);
@@ -945,6 +1076,35 @@ export const SongsPage = (): JSX.Element => {
     window.addEventListener('settings:changed', handleSettingsChanged);
     return () => window.removeEventListener('settings:changed', handleSettingsChanged);
   }, [loadDuplicateSettings]);
+
+  const loadViewportPage = useCallback(async (page: number, mode: TrackViewportLoadMode): Promise<boolean> => {
+    if (isLoadingRef.current) return false;
+    const requestId = requestIdRef.current + 1;
+    await (mode === 'window' ? loadTracks(page, 'replace', { preserveListInstance: true }) : loadTracks(page, mode));
+    return requestIdRef.current === requestId;
+  }, [loadTracks]);
+  const viewportQueryKey = JSON.stringify([listVersion, search, sort, sourceMode, remoteSourceId, audioFormatFilter,
+    effectiveHideDuplicates, showDuplicatesOnly, showOsuOnly]);
+  const loadedCurrentTrackIndex = tracks.findIndex((track) => track.id === currentTrackId);
+  if (currentTrackId && loadedCurrentTrackIndex >= 0) {
+    knownCurrentTrackPositionRef.current = { queryKey: viewportQueryKey, trackId: currentTrackId, index: loadedStartIndex + loadedCurrentTrackIndex };
+  }
+  const knownCurrentPosition = knownCurrentTrackPositionRef.current;
+  const currentTrackIndex = knownCurrentPosition?.queryKey === viewportQueryKey && knownCurrentPosition.trackId === currentTrackId
+    ? knownCurrentPosition.index : null;
+  const requestViewportPage = useTrackViewportPaging({
+    queryKey: viewportQueryKey,
+    pageSize,
+    loadedStartIndex,
+    loadedCount: tracks.length,
+    isLoading,
+    onLoadPage: loadViewportPage,
+  });
+
+  const handleViewportNeeded = useCallback((range: TrackViewportRange): void => {
+    visibleViewportRef.current = range;
+    requestViewportPage(range);
+  }, [requestViewportPage]);
 
   const handleLoadMore = useCallback((): void => {
     if (!isLoading && hasMore) {
@@ -1017,7 +1177,7 @@ export const SongsPage = (): JSX.Element => {
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [t]);
   const handleOpenTrackArtistAction = useCallback((track: LibraryTrack): void => {
     void handleOpenTrackArtist(track);
   }, [handleOpenTrackArtist]);
@@ -1032,7 +1192,7 @@ export const SongsPage = (): JSX.Element => {
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [t]);
   const handleOpenTrackAlbumAction = useCallback((track: LibraryTrack): void => {
     void handleOpenTrackAlbum(track);
   }, [handleOpenTrackAlbum]);
@@ -1230,6 +1390,7 @@ export const SongsPage = (): JSX.Element => {
       return;
     }
 
+    selectedTrackSnapshotsRef.current.set(track.id, { track, index: loadedStartIndex + Math.max(0, tracks.findIndex((item) => item.id === track.id)) });
     setSelectedTrackIds((current) => {
       const next = { ...current };
       if (next[track.id]) {
@@ -1240,7 +1401,7 @@ export const SongsPage = (): JSX.Element => {
 
       return next;
     });
-  }, []);
+  }, [loadedStartIndex, tracks]);
 
   useEffect(() => {
     duplicateHiddenCountsRef.current = {};
@@ -1440,7 +1601,7 @@ export const SongsPage = (): JSX.Element => {
 
     window.addEventListener(likedTracksChangedEvent, handleLikedTracksChanged);
     return () => window.removeEventListener(likedTracksChangedEvent, handleLikedTracksChanged);
-  }, []);
+  }, [t]);
 
   const handleShowVersions = useCallback(async (track: LibraryTrack): Promise<void> => {
     const library = window.echo?.library;
@@ -1462,7 +1623,7 @@ export const SongsPage = (): JSX.Element => {
     } finally {
       setVersionsBusy(false);
     }
-  }, []);
+  }, [t]);
   const handleShowVersionsAction = useCallback((track: LibraryTrack): void => {
     void handleShowVersions(track);
   }, [handleShowVersions]);
@@ -1496,7 +1657,7 @@ export const SongsPage = (): JSX.Element => {
 
     return resolvePlaylistForTrackAdd(library);
 
-  }, []);
+  }, [t]);
 
   const handleAddTracksToPlaylist = useCallback(async (targetTracks: LibraryTrack[], playlistTarget?: LibraryPlaylist): Promise<void> => {
     const library = window.echo?.library;
@@ -1708,7 +1869,7 @@ export const SongsPage = (): JSX.Element => {
             return;
           case 'open-osu-beatmapset':
             {
-              const url = osuBeatmapsetUrl(track);
+              const url = osuBeatmapsetUrl(track) ?? (library ? osuUrlFromComment((await library.loadEmbeddedTrackTags(track.id)).tags.comment) : null);
               if (!url) {
                 setError(t('songs.error.osuBeatmapsetMissing'));
                 return;
@@ -1768,7 +1929,10 @@ export const SongsPage = (): JSX.Element => {
             if (!window.confirm(t('songs.confirm.deleteSong', { title: track.title }))) {
               return;
             }
-            await library?.deleteTrackFile(track.id);
+            const result = await library?.deleteTrackFile(track.id);
+            for (const removedTrackId of result?.removedTrackIds ?? [track.id]) {
+              removeTrackFromQueue(removedTrackId);
+            }
             setTracks((current) => current.filter((item) => item.id !== track.id));
             setTotal((current) => Math.max(0, current - 1));
             setHasMore((current) => current || tracks.length - 1 < total - 1);
@@ -1908,23 +2072,23 @@ export const SongsPage = (): JSX.Element => {
             </button>
           ) : null}
 
-          <div className="sort-select" ref={sortMenuRef}>
+          <div className="sort-select" ref={filterMenuRef}>
             <button
               className="sort-button"
               type="button"
               aria-haspopup="listbox"
-              aria-expanded={isSortOpen && !isSortClosing}
-              aria-label={sortButtonTitle}
-              title={sortButtonTitle}
-              onClick={toggleSortMenu}
+              aria-expanded={isFilterOpen}
+              aria-label={filterButtonTitle}
+              title={filterButtonTitle}
+              onClick={toggleFilterMenu}
             >
               <ListFilter className={activeFilterCount > 0 ? 'sort-button-icon sort-button-icon--active' : 'sort-button-icon'} size={16} aria-hidden="true" />
-              <span className="sort-button-label">{activeSortLabel}</span>
+              <span className="sort-button-label">{filterButtonLabel}</span>
               {activeFilterCount > 0 ? <span className="sort-button-filter-count" aria-hidden="true">{activeFilterCount}</span> : null}
               <ChevronDown className="sort-button-chevron" size={15} aria-hidden="true" />
             </button>
-            {isSortOpen ? (
-              <div className="sort-menu" role="listbox" aria-label={t('songs.sort.menuAria')} data-state={isSortClosing ? 'closing' : 'open'}>
+            {isFilterOpen ? (
+              <div className="sort-menu" role="listbox" aria-label={t('songs.filter.menuAria')} data-state="open">
                 <div className="sort-menu-section-title" role="presentation">{t('songs.filter.section')}</div>
                 <button
                   className="sort-option sort-option--filter"
@@ -1947,24 +2111,6 @@ export const SongsPage = (): JSX.Element => {
                   {showOsuOnly ? <Check size={14} /> : null}
                 </button>
                 <div className="sort-menu-divider" role="presentation" />
-                <div className="sort-menu-section-title" role="presentation">{t('songs.sort.section')}</div>
-                {sortOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    className="sort-option"
-                    type="button"
-                    role="option"
-                    aria-selected={sort === option.value}
-                    onClick={() => {
-                      setSort(option.value);
-                      closeSortMenu();
-                    }}
-                  >
-                    <span>{t(option.labelKey)}</span>
-                    {sort === option.value ? <Check size={14} /> : null}
-                  </button>
-                ))}
-                <div className="sort-menu-divider" role="presentation" />
                 <div className="sort-menu-section-title" role="presentation">{t('songs.filter.audioFormat')}</div>
                 {audioFormatFilterOptions.map((option) => (
                   <button
@@ -1978,6 +2124,48 @@ export const SongsPage = (): JSX.Element => {
                     <span>{t(option.labelKey)}</span>
                     {audioFormatFilter === option.value ? <Check size={14} /> : null}
                   </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="sort-select" ref={sortMenuRef}>
+            <button
+              className="sort-button"
+              type="button"
+              aria-haspopup="listbox"
+              aria-expanded={isSortOpen && !isSortClosing}
+              aria-label={activeSortLabel}
+              title={activeSortLabel}
+              onClick={toggleSortMenu}
+            >
+              <ArrowUpDown className="sort-button-icon" size={16} aria-hidden="true" />
+              <span className="sort-button-label">{activeSortLabel}</span>
+              <ChevronDown className="sort-button-chevron" size={15} aria-hidden="true" />
+            </button>
+            {isSortOpen ? (
+              <div className="sort-menu" role="listbox" aria-label={t('songs.sort.menuAria')} data-state={isSortClosing ? 'closing' : 'open'}>
+                {sortGroups.map((group, groupIndex) => (
+                  <Fragment key={group.labelKey}>
+                    {groupIndex > 0 ? <div className="sort-menu-divider" role="presentation" /> : null}
+                    <div className="sort-menu-section-title" role="presentation">{t(group.labelKey)}</div>
+                    {group.options.map((option) => (
+                      <button
+                        key={option.value}
+                        className="sort-option"
+                        type="button"
+                        role="option"
+                        aria-selected={sort === option.value}
+                        onClick={() => {
+                          setSort(option.value);
+                          closeSortMenu();
+                        }}
+                      >
+                        <span>{t(option.labelKey)}</span>
+                        {sort === option.value ? <Check size={14} /> : null}
+                      </button>
+                    ))}
+                  </Fragment>
                 ))}
               </div>
             ) : null}
@@ -2023,6 +2211,7 @@ export const SongsPage = (): JSX.Element => {
         key={listVersion}
         tracks={tracks}
         currentTrackId={currentTrackId}
+        currentTrackIndex={currentTrackIndex}
         canLoadMore={hasMore && !isLoading}
         canLoadPrevious={loadedStartIndex > 0 && !isLoading}
         totalCount={total}
@@ -2031,6 +2220,7 @@ export const SongsPage = (): JSX.Element => {
         isLoadingMore={isLoading}
         onEndReached={handleLoadMore}
         onStartReached={handleLoadPrevious}
+        onViewportNeeded={handleViewportNeeded}
         onAddToQueue={handleAddTrackToQueue}
         onAddToPlaylist={handleAddTrackToPlaylistAction}
         selectedTrackIds={selectedTrackIds}
@@ -2052,7 +2242,7 @@ export const SongsPage = (): JSX.Element => {
           position={trackMenu.position}
           liked={likedTrackIds[trackMenu.track.id] === true}
           selectionCount={trackMenu.tracks.length}
-          showOpenOsuBeatmapset={showOsuOnly && Boolean(osuBeatmapsetUrl(trackMenu.track))}
+          showOpenOsuBeatmapset={Boolean(osuBeatmapsetUrl(trackMenu.track) || trackMenu.track.fieldSources?.osu === 'osu')}
           onAction={(action, track, playlist) => void handleTrackMenuAction(action, track, playlist)}
           onClose={() => setTrackMenu(null)}
         />

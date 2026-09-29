@@ -1,12 +1,20 @@
 import { app, BrowserWindow } from 'electron';
 import electronUpdater from 'electron-updater';
 import type { UpdateInfo } from 'electron-updater';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { IpcChannels } from '../../shared/constants/ipcChannels';
 import type { AppSettings, AutoUpdateSource } from '../../shared/types/appSettings';
 import type { UpdateStatus } from '../../shared/types/updates';
+import type { UpdateInstallResult } from '../../shared/types/updates';
 import { getAppSettings } from './appSettings';
 import { createDataProtectionSnapshot, writeDataProtectionManifest } from './dataProtection';
+import { getDataBackupStatus } from './dataBackup';
+import { getAudioSession } from '../audio/AudioSession';
+import { getDownloadService } from '../downloads/DownloadService';
+import { getLibraryService } from '../library/LibraryService';
+import { hasPendingTagWrites } from '../library/TagWriter';
+import { isScoopInstallation, getPortableDataPath, runScoopUpdate } from './scoopService';
 
 const { autoUpdater } = electronUpdater;
 
@@ -38,8 +46,79 @@ const genericUpdateFeeds: Partial<Record<AutoUpdateSource, string>> = {
   ghproxyCxkpro: 'https://ghproxy.cxkpro.top/https://github.com/Moekotori/ECHO/releases/latest/download',
 };
 
+const getExecutablePath = (): string => {
+  try {
+    return app.getPath('exe') || process.execPath;
+  } catch {
+    return process.execPath;
+  }
+};
+
+export const isPortableWindowsBuild = (): boolean => {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  const execPath = getExecutablePath();
+  if (isScoopInstallation(execPath)) {
+    return false;
+  }
+  if (process.env.PORTABLE_EXECUTABLE_FILE?.trim()) {
+    return true;
+  }
+  if (getPortableDataPath(execPath)) {
+    return true;
+  }
+  if (app.isPackaged) {
+    const installDir = dirname(execPath);
+    const hasNsisUninstaller =
+      existsSync(join(installDir, 'Uninstall ECHO NEXT.exe')) ||
+      existsSync(join(installDir, 'Uninstall echo-next.exe')) ||
+      existsSync(join(installDir, `Uninstall ${app.name}.exe`));
+    if (!hasNsisUninstaller && !isScoopInstallation(execPath)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const hasPinnedWindowsUpdatePublisher = (): boolean => {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return true;
+  }
+
+  try {
+    const resourcesPath = process.resourcesPath || dirname(app.getPath('exe') || process.execPath);
+    const updateConfig = readFileSync(join(resourcesPath, 'app-update.yml'), 'utf8');
+    return /(?:^|\r?\n)publisherName\s*:\s*(?:\S[^\r\n]*|\r?\n\s*-\s*\S)/u.test(updateConfig);
+  } catch {
+    return false;
+  }
+};
+
 let isUpdaterInitialized = false;
-let autoDownloadUpdatesEnabled = false;
+let lastAttemptedScoopUpdateVersion: string | null = null;
+
+export const resetLastAttemptedScoopUpdateVersionForTest = (): void => {
+  lastAttemptedScoopUpdateVersion = null;
+};
+
+export const resetAutoUpdaterForTest = (): void => {
+  isUpdaterInitialized = false;
+  lastAttemptedScoopUpdateVersion = null;
+  updateStatus = {
+    state: 'idle',
+    currentVersion: currentVersion(),
+    latestVersion: null,
+    releaseName: null,
+    releaseNotes: null,
+    downloadPercent: null,
+    transferredBytes: null,
+    totalBytes: null,
+    bytesPerSecond: null,
+    error: null,
+    checkedAt: null,
+  };
+};
 const formatVersion = (version: string): string => (version.startsWith('v') ? version : `v${version}`);
 const currentVersion = (): string => formatVersion(app.getVersion());
 
@@ -84,19 +163,39 @@ const releaseNotesToText = (releaseNotes: string | ReleaseNoteInfo[] | null | un
   );
 };
 
+const isScoopUpdateSuppressed = (version: string): boolean => {
+  if (!isScoopInstallation(getExecutablePath())) {
+    return false;
+  }
+  const normalizedCandidate = version.replace(/^v/, '');
+  return Boolean(lastAttemptedScoopUpdateVersion && normalizedCandidate === lastAttemptedScoopUpdateVersion);
+};
+
 const applyUpdateInfo = (updateInfo: UpdateInfo): void => {
+  const isSuppressed = isScoopUpdateSuppressed(updateInfo.version);
   updateStatus = {
     ...updateStatus,
     latestVersion: formatVersion(updateInfo.version),
     releaseName: updateInfo.releaseName ?? null,
     releaseNotes: releaseNotesToText(updateInfo.releaseNotes),
     checkedAt: new Date().toISOString(),
+    ...(isSuppressed ? { state: 'not-available' as const } : {}),
   };
 };
 
 const resolveGenericFeedUrl = (settings: Pick<AppSettings, 'autoUpdateSource' | 'autoUpdateCustomUrl'>): string | null => {
   if (settings.autoUpdateSource === 'custom') {
-    return settings.autoUpdateCustomUrl?.trim().replace(/\/+$/u, '') || null;
+    const candidate = settings.autoUpdateCustomUrl?.trim();
+    if (!candidate) {
+      return null;
+    }
+
+    try {
+      const url = new URL(candidate);
+      return url.protocol === 'https:' ? url.toString().replace(/\/+$/u, '') : null;
+    } catch {
+      return null;
+    }
   }
 
   return genericUpdateFeeds[settings.autoUpdateSource ?? 'official'] ?? null;
@@ -107,6 +206,16 @@ const configureUpdateFeed = (): boolean => {
   const genericUrl = resolveGenericFeedUrl(settings);
 
   if (genericUrl) {
+    if (!hasPinnedWindowsUpdatePublisher()) {
+      updateStatus = {
+        ...updateStatus,
+        state: 'error',
+        error: 'Third-party update sources require a signed release with a pinned Windows publisher.',
+        checkedAt: new Date().toISOString(),
+      };
+      emitUpdateStatus();
+      return false;
+    }
     autoUpdater.setFeedURL({ provider: 'generic', url: genericUrl });
     return true;
   }
@@ -127,7 +236,7 @@ const configureUpdateFeed = (): boolean => {
 };
 
 const configureWindowsInstallDirectory = (): void => {
-  if (process.platform !== 'win32' || !app.isPackaged) {
+  if (process.platform !== 'win32' || !app.isPackaged || isPortableWindowsBuild()) {
     return;
   }
 
@@ -146,11 +255,11 @@ export const getUpdateStatus = (): UpdateStatus => ({
 });
 
 export const setAutoUpdateEnabled = (enabled: boolean): UpdateStatus => {
-  autoDownloadUpdatesEnabled = enabled;
+  const effectiveEnabled = enabled && !isPortableWindowsBuild();
   autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = enabled;
+  autoUpdater.autoInstallOnAppQuit = false;
 
-  if (!enabled) {
+  if (!effectiveEnabled) {
     updateStatus = {
       ...updateStatus,
       state: 'disabled',
@@ -223,11 +332,21 @@ export const checkForUpdates = async (): Promise<UpdateStatus> => {
 };
 
 export const downloadUpdate = async (): Promise<UpdateStatus> => {
-  if (!app.isPackaged) {
+  if (!app.isPackaged || isPortableWindowsBuild()) {
+    return getUpdateStatus();
+  }
+  if (updateStatus.state !== 'available') {
     return getUpdateStatus();
   }
 
-  if (updateStatus.state !== 'available') {
+  if (isScoopInstallation(getExecutablePath())) {
+    updateStatus = {
+      ...updateStatus,
+      state: 'downloaded',
+      downloadPercent: 100,
+      error: null,
+    };
+    emitUpdateStatus();
     return getUpdateStatus();
   }
 
@@ -258,9 +377,60 @@ export const downloadUpdate = async (): Promise<UpdateStatus> => {
 };
 
 export const reconfigureAutoUpdateFeed = (): UpdateStatus => {
+  if (isPortableWindowsBuild()) {
+    return getUpdateStatus();
+  }
   configureUpdateFeed();
   emitUpdateStatus();
   return getUpdateStatus();
+};
+
+const activeDownloadStates = new Set(['queued', 'probing', 'downloading', 'extracting_audio', 'importing', 'binding_mv']);
+
+export const installDownloadedUpdate = async (): Promise<UpdateInstallResult> => {
+  if (isPortableWindowsBuild()) {
+    return { outcome: 'error', error: 'Portable builds use manual updates.' };
+  }
+
+  const isScoop = isScoopInstallation(getExecutablePath());
+
+  if (updateStatus.state !== 'downloaded' && (!isScoop || updateStatus.state !== 'available')) {
+    return { outcome: 'error', error: 'No downloaded update is ready to install.' };
+  }
+
+  const reasons: string[] = [];
+  const playbackState = getAudioSession().getStatus().state;
+  if (playbackState === 'playing' || playbackState === 'loading') reasons.push('playback');
+  if (getDownloadService().getJobs().some((job) => activeDownloadStates.has(job.status))) reasons.push('downloads');
+  if (getLibraryService().hasRunningJobs()) reasons.push('library-scan');
+  if (hasPendingTagWrites()) reasons.push('tag-writes');
+  if (getDataBackupStatus().running) reasons.push('data-backup');
+  if (reasons.length > 0) return { outcome: 'blocked', reasons };
+
+  try {
+    if (getAppSettings().dataProtectionDisabled !== true) {
+      writeDataProtectionManifest();
+      await createDataProtectionSnapshot('update-install');
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[data-protection] update install blocked because the protected-data snapshot failed', error);
+    return { outcome: 'error', error: `Protected-data snapshot failed: ${message}` };
+  }
+
+  if (isScoop) {
+    lastAttemptedScoopUpdateVersion = updateStatus.latestVersion?.replace(/^v/, '') ?? null;
+    const launched = runScoopUpdate();
+    if (!launched) {
+      return { outcome: 'error', error: 'Failed to launch Scoop updater.' };
+    }
+    app.quit();
+    return { outcome: 'installing' };
+  }
+
+  configureWindowsInstallDirectory();
+  autoUpdater.quitAndInstall();
+  return { outcome: 'installing' };
 };
 
 export const initializeAutoUpdater = (enabled: boolean): void => {
@@ -271,7 +441,7 @@ export const initializeAutoUpdater = (enabled: boolean): void => {
   isUpdaterInitialized = true;
   setAutoUpdateEnabled(enabled);
   configureWindowsInstallDirectory();
-  if (enabled) {
+  if (enabled && !isPortableWindowsBuild()) {
     configureUpdateFeed();
   }
 
@@ -282,6 +452,10 @@ export const initializeAutoUpdater = (enabled: boolean): void => {
 
   autoUpdater.on('update-available', (updateInfo) => {
     applyUpdateInfo(updateInfo);
+    if (isScoopUpdateSuppressed(updateInfo.version)) {
+      emitUpdateStatus();
+      return;
+    }
     updateStatus = {
       ...updateStatus,
       state: 'available',
@@ -292,9 +466,6 @@ export const initializeAutoUpdater = (enabled: boolean): void => {
       error: null,
     };
     emitUpdateStatus();
-    if (autoDownloadUpdatesEnabled) {
-      void downloadUpdate();
-    }
   });
 
   autoUpdater.on('download-progress', (progressInfo: DownloadProgressInfo) => {
@@ -337,28 +508,14 @@ export const initializeAutoUpdater = (enabled: boolean): void => {
 
   autoUpdater.on('update-downloaded', (updateInfo) => {
     applyUpdateInfo(updateInfo);
-    void (async () => {
-      try {
-        if (getAppSettings().dataProtectionDisabled !== true) {
-          writeDataProtectionManifest();
-          await createDataProtectionSnapshot('update-install');
-        }
-      } catch (error) {
-        console.warn('[data-protection] failed to snapshot protected data before update install', error);
-      }
-      updateStatus = {
-        ...updateStatus,
-        state: 'downloaded',
-        downloadPercent: 100,
-        transferredBytes: updateStatus.totalBytes,
-        error: null,
-      };
-      emitUpdateStatus();
-      setTimeout(() => {
-        configureWindowsInstallDirectory();
-        autoUpdater.quitAndInstall();
-      }, 1000);
-    })();
+    updateStatus = {
+      ...updateStatus,
+      state: 'downloaded',
+      downloadPercent: 100,
+      transferredBytes: updateStatus.totalBytes,
+      error: null,
+    };
+    emitUpdateStatus();
   });
 
   if (!app.isPackaged) {
@@ -368,7 +525,7 @@ export const initializeAutoUpdater = (enabled: boolean): void => {
     return;
   }
 
-  if (enabled) {
+  if (enabled && !isPortableWindowsBuild()) {
     void checkForUpdates();
   }
 };

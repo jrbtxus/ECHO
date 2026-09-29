@@ -1,25 +1,21 @@
-import { Suspense, cloneElement, isValidElement, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, cloneElement, isValidElement, lazy, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactElement, ReactNode } from 'react';
 import { X } from 'lucide-react';
 import { PlayerBar } from '../components/player/PlayerBar';
-import { PlaybackQueueDrawer } from '../components/player/PlaybackQueueDrawer';
-import { AudioSettingsDrawer } from '../components/player/AudioSettingsDrawer';
-import { AudioIssueDiagnosticsWindow } from '../components/player/AudioIssueDiagnosticsWindow';
-import { LyricsSettingsDrawer } from '../components/lyrics/LyricsSettingsDrawer';
-import { LyricsVisualSettingsDrawer } from '../components/lyrics/LyricsVisualSettingsDrawer';
-import { MvSettingsDrawer } from '../components/lyrics/MvSettingsDrawer';
 import { contrastRatio, parseHexColor, sampleImageUrl, type ReadableColorSample, type Rgb } from '../components/lyrics/lyricsReadableColor';
 import { DragDropImportOverlay } from '../components/import/DragDropImportOverlay';
 import { PluginTrackActionDrawerHost } from '../components/library/PluginTrackActionDrawer';
-import { FirstRunWizard } from '../components/onboarding/FirstRunWizard';
-import { UserNoticeGate } from '../components/onboarding/UserNoticeGate';
 import { loadPersistedRememberedAudioOutput } from '../components/player/audioOutputMemory';
+import { isUltraLightRendererRestore } from '../../shared/types/ultraLightMode';
+import { hasResidentAudioPlayback } from '../utils/audioControlHydration';
 import { Sidebar } from '../components/layout/Sidebar';
 import { AppTitleBar } from '../components/layout/AppTitleBar';
 import { EditableContextMenu } from '../components/ui/EditableContextMenu';
 import { formatAudioHostError, shouldSuppressAudioHostError } from '../components/player/audioErrorFormat';
 import { type AudioErrorNoticeEventDetail, showAudioErrorNoticeEvent } from '../utils/audioErrorNotice';
-import { createPluginPanelRoutes } from './routes';
+import { formatUserFacingError } from '../utils/userFacingError';
+import { getAudioOutputRouteMutationSequence } from '../utils/audioOutputRouteEvents';
+import { createPluginPanelRoutes, pendingAppRouteStorageKey, preloadAppRoute } from './routes';
 import type { AppRoute, AppRouteId } from './routes';
 import {
   audioEchoSrcFilterProfiles,
@@ -36,24 +32,31 @@ import {
   type AudioSdmTargetRate,
   type AudioStatus,
 } from '../../shared/types/audio';
-import type { AccountProvider, AccountStatus } from '../../shared/types/accounts';
-import { currentUserNoticeVersion, type AppSettings, type AppThemeMode } from '../../shared/types/appSettings';
-import { echoProUnlockPluginId } from '../../shared/constants/featureUnlocks';
+import { type AppSettings, type AppThemeMode } from '../../shared/types/appSettings';
+import { resolveEffectivePerformancePolicy } from '../../shared/utils/performancePolicy';
 import type { DiagnosticMemoryPressureEvent } from '../../shared/types/diagnostics';
 import type { DownloadJob } from '../../shared/types/downloads';
+import { musicDownloadsEnabled } from '../../shared/constants/downloadAvailability';
 import type { LibraryTrack } from '../../shared/types/library';
 import type { UpdateStatus } from '../../shared/types/updates';
+import { isAuthorizationFailure } from '../../shared/ipcAuthorizationFailure';
 import { useI18n } from '../i18n/I18nProvider';
 import { likedChangedEvent, likedTracksChangedEvent } from '../hooks/useLikedMedia';
-import type { TranslationKey } from '../i18n/locales';
 import { logLyricsConsole } from '../diagnostics/lyricsConsole';
 import { rememberLibraryScanStatus } from '../stores/libraryScanSession';
 import { clearSongsFirstPageSnapshot } from '../stores/songsFirstPageSnapshot';
-import { usePlaybackQueue, type QueueItem } from '../stores/PlaybackQueueProvider';
+import { usePlaybackQueue } from '../stores/PlaybackQueueProvider';
 import { setPlaybackStatusSnapshot, useSharedPlaybackStatus } from '../stores/playbackStatusStore';
 import { useLibraryStartupArtworkPreloader } from '../hooks/useLibraryStartupArtworkPreloader';
 import { albumDetailNavigationEvent } from '../utils/albumNavigation';
 import { artistDetailNavigationEvent } from '../utils/artistNavigation';
+import { localCoverDisplayUrl } from '../utils/coverDisplayUrl';
+import { isImeComposingKeyEvent } from '../utils/imeInput';
+import {
+  acceleratorFromKeyboardEvent,
+  acceleratorFromMouseEvent,
+  isShortcutTextTarget,
+} from '../utils/shortcutAccelerator';
 import { AnimatedOutlet } from '../ui/motion/AnimatedOutlet';
 import { applySidebarPreferences } from './sidebarPreferences';
 import {
@@ -67,8 +70,29 @@ import {
 } from '../../shared/types/sidebar';
 import type { PlaybackStatus } from '../../shared/types/playback';
 
+const AudioSettingsDrawer = lazy(() => import('../components/player/AudioSettingsDrawer').then((module) => ({ default: module.AudioSettingsDrawer })));
+const PlaybackQueueDrawer = lazy(() => import('../components/player/PlaybackQueueDrawer').then((module) => ({ default: module.PlaybackQueueDrawer })));
+const AudioIssueDiagnosticsWindow = lazy(() => import('../components/player/AudioIssueDiagnosticsWindow').then((module) => ({ default: module.AudioIssueDiagnosticsWindow })));
+const LyricsSettingsDrawer = lazy(() => import('../components/lyrics/LyricsSettingsDrawer').then((module) => ({ default: module.LyricsSettingsDrawer })));
+const LyricsVisualSettingsDrawer = lazy(() => import('../components/lyrics/LyricsVisualSettingsDrawer').then((module) => ({ default: module.LyricsVisualSettingsDrawer })));
+const MvSettingsDrawer = lazy(() => import('../components/lyrics/MvSettingsDrawer').then((module) => ({ default: module.MvSettingsDrawer })));
+const FirstRunWizard = lazy(() => import('../components/onboarding/FirstRunWizard').then((module) => ({ default: module.FirstRunWizard })));
+const SteamEditionWelcome = lazy(() => import('../components/onboarding/SteamEditionWelcome').then((module) => ({ default: module.SteamEditionWelcome })));
+
 type AppLayoutProps = {
   routes: AppRoute[];
+};
+
+const useMountedOnce = (active: boolean): boolean => {
+  const [mounted, setMounted] = useState(active);
+
+  useEffect(() => {
+    if (active) {
+      setMounted(true);
+    }
+  }, [active]);
+
+  return mounted;
 };
 
 type LyricsNavigationDetail = {
@@ -86,9 +110,6 @@ type RouteSwitchTrace = {
 };
 
 const lyricsViewModeMemoryKey = 'echo:lyrics:view-mode';
-const isEchoProUnlockPluginActive = (plugin: { id: string; enabled: boolean; status: string; disabledByHost?: boolean }): boolean =>
-  plugin.id === echoProUnlockPluginId && plugin.enabled === true && plugin.disabledByHost !== true && plugin.status !== 'error';
-
 const normalizeEchoSrcFilterProfile = (
   value: unknown,
   fallback: AudioEchoSrcFilterProfile = 'poly-sinc-gauss-long',
@@ -223,9 +244,15 @@ type AppWallpaperSettings = Pick<
   | 'appWallpaperBlurPx'
   | 'appWallpaperBrightnessPercent'
   | 'appWallpaperUiOpacityPercent'
+  | 'appWallpaperOpacityPercent'
   | 'appWallpaperVisualProtectionEnabled'
   | 'appWallpaperUnifiedOpacityEnabled'
+  | 'appWallpaperFitMode'
+  | 'appWallpaperPosition'
+  | 'appPortraitWallpaperFitMode'
+  | 'appPortraitWallpaperPosition'
   | 'appVideoWallpaperPauseMode'
+  | 'lowSpecModeEnabled'
 >;
 
 type LyricsMiniPlayerSettings = Pick<
@@ -233,6 +260,8 @@ type LyricsMiniPlayerSettings = Pick<
   | 'lyricsPlayerBarDrawerEnabled'
   | 'lyricsPlayerBarDrawerAutoEnableForMv'
   | 'lyricsPlayerBarDrawerAutoHideEnabled'
+  | 'lyricsPlayerBarDrawerShortcutEnabled'
+  | 'lyricsPlayerBarDrawerShortcutAccelerator'
   | 'lyricsPlayerBarDrawerCompactOnIdleEnabled'
   | 'lyricsPlayerBarDrawerOpacityPercent'
   | 'lyricsPlayerBarDrawerColorMode'
@@ -250,18 +279,26 @@ const defaultAppWallpaperSettings: AppWallpaperSettings = {
   appWallpaperBlurPx: 0,
   appWallpaperBrightnessPercent: 100,
   appWallpaperUiOpacityPercent: 100,
+  appWallpaperOpacityPercent: 100,
   appWallpaperVisualProtectionEnabled: true,
   appWallpaperUnifiedOpacityEnabled: false,
+  appWallpaperFitMode: 'fill',
+  appWallpaperPosition: null,
+  appPortraitWallpaperFitMode: 'fill',
+  appPortraitWallpaperPosition: null,
   appVideoWallpaperPauseMode: 'smart',
   appWindowAcrylicEnabled: false,
   appWindowAcrylicKeepWhenUnfocusedEnabled: false,
   appWindowAcrylicTransparencyPercent: 70,
+  lowSpecModeEnabled: false,
 };
 
 const defaultLyricsMiniPlayerSettings: LyricsMiniPlayerSettings = {
   lyricsPlayerBarDrawerEnabled: true,
   lyricsPlayerBarDrawerAutoEnableForMv: true,
   lyricsPlayerBarDrawerAutoHideEnabled: false,
+  lyricsPlayerBarDrawerShortcutEnabled: false,
+  lyricsPlayerBarDrawerShortcutAccelerator: null,
   lyricsPlayerBarDrawerCompactOnIdleEnabled: false,
   lyricsPlayerBarDrawerOpacityPercent: 78,
   lyricsPlayerBarDrawerColorMode: 'default',
@@ -284,7 +321,7 @@ const normalizeAppThemeMode = (value: unknown): AppThemeMode =>
 const readDocumentThemeMode = (): AppThemeMode => normalizeAppThemeMode(document.documentElement.dataset.themeMode);
 
 const downloadLibraryChangeDebounceMs = 250;
-const persistentRouteIds = new Set<AppRouteId>(['songs', 'albums', 'artists', 'streaming', 'playlists']);
+const persistentRouteIds = new Set<AppRouteId>(['songs', 'albums', 'artists', 'streaming', 'playlists', 'lyrics']);
 const readSongsNavigationRemoteSourceId = (event: Event): string | null => {
   if (!(event instanceof CustomEvent) || typeof event.detail !== 'object' || event.detail === null) {
     return null;
@@ -312,21 +349,10 @@ const readAudioErrorNoticeMessage = (event: Event): string | null => {
 
   return null;
 };
-const accountProviderLabelKeys: Record<AccountProvider, TranslationKey> = {
-  netease: 'accountProvider.netease',
-  qqmusic: 'accountProvider.qqmusic',
-  kugou: 'accountProvider.kugou',
-  bilibili: 'accountProvider.bilibili',
-  youtube: 'accountProvider.youtube',
-  soundcloud: 'accountProvider.soundcloud',
-  spotify: 'accountProvider.spotify',
-  tidal: 'accountProvider.tidal',
-  qobuz: 'accountProvider.qobuz',
-  osu: 'accountProvider.osu',
-};
-
 const isSpotifyPlaybackSetupError = (message: string): boolean =>
   /spotify/iu.test(message) && /(SDK|DRM\/Widevine|keysystem|playback device|Connect device|official player)/iu.test(message);
+const isMissingAudioRuntimeComponentError = (message: string): boolean =>
+  /echo-audio-host binary not found|echo-audio-host spawn_error:.*(?:ENOENT|0xC0000135|126)|ffmpeg_missing|(?:spawn|open)\s+ffmpeg(?:\.exe)?\s+ENOENT/iu.test(message);
 
 const inferAppWallpaperMediaType = (filePath: string | null | undefined): NonNullable<AppSettings['appWallpaperMediaType']> =>
   filePath && /\.(?:mp4|m4v|webm)$/iu.test(filePath.trim()) ? 'video' : 'image';
@@ -342,26 +368,39 @@ const selectAppWallpaperSettings = (settings: AppSettings): AppWallpaperSettings
   appWallpaperBlurPx: settings.appWallpaperBlurPx,
   appWallpaperBrightnessPercent: settings.appWallpaperBrightnessPercent,
   appWallpaperUiOpacityPercent: settings.appWallpaperUiOpacityPercent,
+  appWallpaperOpacityPercent: settings.appWallpaperOpacityPercent ?? 100,
   appWallpaperVisualProtectionEnabled: settings.appWallpaperVisualProtectionEnabled !== false,
   appWallpaperUnifiedOpacityEnabled: settings.appWallpaperUnifiedOpacityEnabled,
+  appWallpaperFitMode: settings.appWallpaperFitMode ?? 'fill',
+  appWallpaperPosition: settings.appWallpaperPosition ?? null,
+  appPortraitWallpaperFitMode: settings.appPortraitWallpaperFitMode ?? 'fill',
+  appPortraitWallpaperPosition: settings.appPortraitWallpaperPosition ?? null,
   appVideoWallpaperPauseMode: settings.appVideoWallpaperPauseMode ?? 'smart',
   appWindowAcrylicEnabled: settings.appWindowAcrylicEnabled === true,
   appWindowAcrylicKeepWhenUnfocusedEnabled: settings.appWindowAcrylicKeepWhenUnfocusedEnabled === true,
   appWindowAcrylicTransparencyPercent: Number.isFinite(settings.appWindowAcrylicTransparencyPercent)
     ? Math.max(0, Math.min(100, Math.round(Number(settings.appWindowAcrylicTransparencyPercent))))
     : defaultAppWallpaperSettings.appWindowAcrylicTransparencyPercent,
+  lowSpecModeEnabled: settings.lowSpecModeEnabled === true,
 });
 
 const selectLyricsMiniPlayerSettings = (settings: Partial<AppSettings>): LyricsMiniPlayerSettings => ({
   lyricsPlayerBarDrawerEnabled: settings.lyricsPlayerBarDrawerEnabled !== false,
   lyricsPlayerBarDrawerAutoEnableForMv: settings.lyricsPlayerBarDrawerAutoEnableForMv !== false,
   lyricsPlayerBarDrawerAutoHideEnabled: settings.lyricsPlayerBarDrawerAutoHideEnabled === true,
+  lyricsPlayerBarDrawerShortcutEnabled: settings.lyricsPlayerBarDrawerShortcutEnabled === true,
+  lyricsPlayerBarDrawerShortcutAccelerator:
+    typeof settings.lyricsPlayerBarDrawerShortcutAccelerator === 'string'
+      ? settings.lyricsPlayerBarDrawerShortcutAccelerator
+      : null,
   lyricsPlayerBarDrawerCompactOnIdleEnabled: settings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true,
   lyricsPlayerBarDrawerOpacityPercent: Number.isFinite(settings.lyricsPlayerBarDrawerOpacityPercent)
     ? Math.max(20, Math.min(100, Math.round(Number(settings.lyricsPlayerBarDrawerOpacityPercent))))
     : defaultLyricsMiniPlayerSettings.lyricsPlayerBarDrawerOpacityPercent,
   lyricsPlayerBarDrawerColorMode:
-    settings.lyricsPlayerBarDrawerColorMode === 'custom' || settings.lyricsPlayerBarDrawerColorMode === 'cover'
+    settings.lyricsPlayerBarDrawerColorMode === 'custom' ||
+    settings.lyricsPlayerBarDrawerColorMode === 'cover' ||
+    settings.lyricsPlayerBarDrawerColorMode === 'light'
       ? settings.lyricsPlayerBarDrawerColorMode
       : defaultLyricsMiniPlayerSettings.lyricsPlayerBarDrawerColorMode,
   lyricsPlayerBarDrawerColor: /^#[0-9a-fA-F]{6}$/u.test(settings.lyricsPlayerBarDrawerColor ?? '')
@@ -369,15 +408,9 @@ const selectLyricsMiniPlayerSettings = (settings: Partial<AppSettings>): LyricsM
     : defaultLyricsMiniPlayerSettings.lyricsPlayerBarDrawerColor,
 });
 
-const originalCoverUrlFromThumb = (coverUrl: string | null): string | null =>
-  coverUrl?.replace(/^echo-cover:\/\/(?:thumb|album|large)\//u, 'echo-cover://original/') ?? null;
-
 const miniPlayerArtworkUrl = (
   track: { coverId: string | null; coverThumb: string | null } | null,
-): string | null =>
-  track?.coverId
-    ? `echo-cover://original/${encodeURIComponent(track.coverId)}`
-    : originalCoverUrlFromThumb(track?.coverThumb ?? null);
+): string | null => localCoverDisplayUrl(track?.coverId, track?.coverThumb);
 
 const mixRgb = (from: Rgb, to: Rgb, amount: number): Rgb => {
   const weight = Math.max(0, Math.min(1, amount));
@@ -407,15 +440,26 @@ const tintedMiniPlayerRgb = (sample: ReadableColorSample): Rgb => {
 const miniPlayerReadableLight = { r: 255, g: 255, b: 255 };
 const miniPlayerReadableLightMuted = { r: 248, g: 250, b: 252 };
 const miniPlayerReadableDark = { r: 17, g: 24, b: 39 };
+const miniPlayerLightSurface = { r: 244, g: 247, b: 251 };
+const miniPlayerLightBackdrop = { r: 238, g: 242, b: 247 };
+const miniPlayerDarkBackdrop = { r: 7, g: 10, b: 15 };
 
-const getMiniPlayerReadablePalette = (backgroundRgb: Rgb): Record<string, string> => {
+const getMiniPlayerReadablePalette = (
+  backgroundRgb: Rgb,
+  surfaceOpacity = 1,
+  backdropRgb: Rgb = backgroundRgb,
+): Record<string, string> => {
+  const visibleBackgroundRgb = mixRgb(backdropRgb, backgroundRgb, surfaceOpacity);
   const useLightText =
-    contrastRatio(miniPlayerReadableLight, backgroundRgb) >= contrastRatio(miniPlayerReadableDark, backgroundRgb);
+    contrastRatio(miniPlayerReadableLight, visibleBackgroundRgb) >=
+    contrastRatio(miniPlayerReadableDark, visibleBackgroundRgb);
 
   return useLightText
     ? {
         '--lyrics-mini-player-readable-text': formatCssRgb(miniPlayerReadableLight),
         '--lyrics-mini-player-readable-muted': formatCssRgb(miniPlayerReadableLightMuted),
+        '--lyrics-mini-player-time-text': formatCssRgb(miniPlayerReadableLight),
+        '--lyrics-mini-player-progress-fill': 'rgba(255, 255, 255, 0.94)',
         '--lyrics-mini-player-readable-shadow': '0 1px 2px rgba(0, 0, 0, 0.48)',
         '--lyrics-mini-player-readable-button-bg': 'rgba(255, 255, 255, 0.10)',
         '--lyrics-mini-player-readable-button-bg-hover': 'rgba(255, 255, 255, 0.18)',
@@ -429,6 +473,8 @@ const getMiniPlayerReadablePalette = (backgroundRgb: Rgb): Record<string, string
     : {
         '--lyrics-mini-player-readable-text': formatCssRgb(miniPlayerReadableDark),
         '--lyrics-mini-player-readable-muted': formatCssRgb(miniPlayerReadableDark),
+        '--lyrics-mini-player-time-text': formatCssRgb(miniPlayerReadableDark),
+        '--lyrics-mini-player-progress-fill': 'rgba(17, 24, 39, 0.86)',
         '--lyrics-mini-player-readable-shadow': '0 1px 0 rgba(255, 255, 255, 0.54)',
         '--lyrics-mini-player-readable-button-bg': 'rgba(17, 24, 39, 0.08)',
         '--lyrics-mini-player-readable-button-bg-hover': 'rgba(17, 24, 39, 0.14)',
@@ -451,25 +497,22 @@ const openAudioSettingsEvent = 'app:open-audio-settings';
 const openMvSettingsEvent = 'app:open-mv-settings';
 const openLyricsSettingsEvent = 'app:open-lyrics-settings';
 const openLyricsVisualSettingsEvent = 'app:open-lyrics-visual-settings';
-const openUserNoticeEvent = 'app:open-user-notice';
 const lyricsDrawerToolsChangedEvent = 'app:lyrics-drawer-tools-changed';
 const settingsBackNavigationEvent = 'app:navigate:settings-back';
 const showChromeNoticeEvent = 'app:show-chrome-notice';
-const pendingRouteStorageKey = 'echo-next.pending-route';
 const pendingSettingsSectionStorageKey = 'echo-next.settings.pending-section';
 const settingsSectionNavigationEvent = 'app:navigate:settings-section';
 const lyricsMiniPlayerAutoHideDistancePx = 150;
 const lyricsMiniPlayerAutoHideRevealBandPx = 164;
 const lyricsMiniPlayerAutoHideDelayMs = 280;
 const defaultChromeNoticeAutoHideMs = 5000;
+const updateNoticeAutoHideMs = 5000;
 const quickAudioNoticeAutoHideMs = 1800;
 const upcomingTrackNoticeLeadSeconds = 10;
 const upcomingTrackNoticeAutoHideMs = 6400;
 const chromeNoticeEnterDelayMs = 16;
 const chromeNoticeExitAnimationMs = 260;
 const startupBlockedRouteIds = new Set<AppRouteId>(['streaming']);
-const readSuppressAccountExpiryNotices = (settings: Partial<AppSettings> | null | undefined): boolean =>
-  settings?.suppressAccountExpiryNotices === true;
 const readNotificationsDisabled = (settings: Partial<AppSettings> | null | undefined): boolean =>
   settings?.notificationsDisabled === true;
 const readUpcomingTrackNoticeEnabled = (settings: Partial<AppSettings> | null | undefined): boolean =>
@@ -585,40 +628,6 @@ const getPlaybackClock = (
   };
 };
 
-const findCurrentQueueIndex = (
-  items: QueueItem[],
-  currentQueueId: string | null,
-  currentTrackId: string | null,
-): number => {
-  const queueIndex = currentQueueId ? items.findIndex((item) => item.queueId === currentQueueId) : -1;
-  if (queueIndex >= 0) {
-    return queueIndex;
-  }
-  return currentTrackId ? items.findIndex((item) => item.track.id === currentTrackId) : -1;
-};
-
-const resolveUpcomingQueueItem = (
-  items: QueueItem[],
-  currentQueueId: string | null,
-  currentTrackId: string | null,
-  repeatMode: 'off' | 'one' | 'all',
-): QueueItem | null => {
-  if (items.length === 0 || repeatMode === 'one') {
-    return null;
-  }
-
-  const currentIndex = findCurrentQueueIndex(items, currentQueueId, currentTrackId);
-  if (currentIndex < 0) {
-    return null;
-  }
-
-  if (currentIndex < items.length - 1) {
-    return items[currentIndex + 1] ?? null;
-  }
-
-  return repeatMode === 'all' ? items[0] ?? null : null;
-};
-
 const trimRateTrailingZero = (value: string): string => value.replace(/\.0$/u, '');
 
 const formatAudioNoticeRate = (value: number): string => {
@@ -661,9 +670,9 @@ const readInitialRouteId = (routes: AppRoute[]): AppRouteId => {
   const fallbackRouteId = readFallbackRouteId(routes);
 
   try {
-    const pendingRoute = window.localStorage.getItem(pendingRouteStorageKey);
+    const pendingRoute = window.localStorage.getItem(pendingAppRouteStorageKey);
     if (pendingRoute && routes.some((route) => route.id === pendingRoute)) {
-      window.localStorage.removeItem(pendingRouteStorageKey);
+      window.localStorage.removeItem(pendingAppRouteStorageKey);
       return isStartupBlockedRouteId(pendingRoute as AppRouteId) ? fallbackRouteId : pendingRoute as AppRouteId;
     }
   } catch {
@@ -688,15 +697,17 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const playbackQueue = usePlaybackQueue();
   const playbackStatusSnapshot = useSharedPlaybackStatus();
   useLibraryStartupArtworkPreloader();
+  const preloadSettingsRoute = useCallback((): void => {
+    void preloadAppRoute('settings');
+  }, []);
   const [activeRouteId, setActiveRouteId] = useState<AppRouteId>(() => readInitialRouteId(routes));
   const [chromeNotice, setChromeNotice] = useState<string | null>(null);
   const [chromeNoticeAutoHideMs, setChromeNoticeAutoHideMs] = useState(defaultChromeNoticeAutoHideMs);
   const [availableUpdateStatus, setAvailableUpdateStatus] = useState<UpdateStatus | null>(null);
   const [isUpdateNoticeVisible, setIsUpdateNoticeVisible] = useState(false);
+  const hasShownUpdateNoticeRef = useRef(false);
   const [updateActionBusy, setUpdateActionBusy] = useState(false);
   const [isChromeNoticeVisible, setIsChromeNoticeVisible] = useState(false);
-  const [accountNotice, setAccountNotice] = useState<string | null>(null);
-  const suppressAccountExpiryNoticesRef = useRef(false);
   const [notificationsDisabled, setNotificationsDisabled] = useState(false);
   const notificationsDisabledRef = useRef(false);
   const [upcomingTrackNoticeEnabled, setUpcomingTrackNoticeEnabled] = useState(false);
@@ -707,41 +718,47 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const [isUpcomingTrackNoticeVisible, setIsUpcomingTrackNoticeVisible] = useState(false);
   const lastUpcomingTrackNoticeKeyRef = useRef<string | null>(null);
   const lastUpcomingTrackPlaybackIdentityRef = useRef<string | null>(null);
-  const [audioErrorNotice, setAudioErrorNotice] = useState<{ message: string } | null>(null);
+  const [audioErrorNotice, setAudioErrorNotice] = useState<{
+    message: string;
+    rawError: string;
+    source: 'playback-status' | 'event';
+  } | null>(null);
+  const [audioComponentNotice, setAudioComponentNotice] = useState(false);
+  const [audioComponentActionBusy, setAudioComponentActionBusy] = useState(false);
   const [diagnosticsNotice, setDiagnosticsNotice] = useState(false);
   const [memoryPressureNotice, setMemoryPressureNotice] = useState<DiagnosticMemoryPressureEvent | null>(null);
   const [firstRunSettings, setFirstRunSettings] = useState<AppSettings | null>(null);
-  const [userNoticeSettingsLoaded, setUserNoticeSettingsLoaded] = useState(false);
-  const [userNoticeAccepted, setUserNoticeAccepted] = useState(false);
-  const [userNoticeReviewOpen, setUserNoticeReviewOpen] = useState(false);
   const [isFirstRunWizardOpen, setIsFirstRunWizardOpen] = useState(false);
   const [isFirstRunWizardClosing, setIsFirstRunWizardClosing] = useState(false);
   const firstRunWizardMountedRef = useRef(false);
   const firstRunWizardCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [downloadsFeatureUnlocked, setDownloadsFeatureUnlocked] = useState(false);
-  const [connectDonatorUnlocked, setConnectDonatorUnlocked] = useState(false);
-  const [echoProPluginUnlocked, setEchoProPluginUnlocked] = useState(false);
   const [pluginPanelRoutes, setPluginPanelRoutes] = useState<AppRoute[]>([]);
   const [isAudioDrawerOpen, setIsAudioDrawerOpen] = useState(false);
   const [isLyricsDrawerOpen, setIsLyricsDrawerOpen] = useState(false);
   const [isLyricsVisualDrawerOpen, setIsLyricsVisualDrawerOpen] = useState(false);
   const [lyricsDrawerCurrentTrackTools, setLyricsDrawerCurrentTrackTools] = useState<ReactNode | null>(null);
   const [isMvDrawerOpen, setIsMvDrawerOpen] = useState(false);
+  const shouldMountAudioDrawer = useMountedOnce(isAudioDrawerOpen);
+  const shouldMountLyricsDrawer = useMountedOnce(isLyricsDrawerOpen);
+  const shouldMountLyricsVisualDrawer = useMountedOnce(isLyricsVisualDrawerOpen);
+  const shouldMountMvDrawer = useMountedOnce(isMvDrawerOpen);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const [isWindowFullscreenTransitioning, setIsWindowFullscreenTransitioning] = useState(false);
   const [windowFullscreenTransitionTarget, setWindowFullscreenTransitionTarget] = useState<boolean | null>(null);
   const [isLyricsQueueDrawerOpen, setIsLyricsQueueDrawerOpen] = useState(false);
+  const shouldMountLyricsQueueDrawer = useMountedOnce(isLyricsQueueDrawerOpen);
   const [desktopLyricsVisible, setDesktopLyricsVisible] = useState(false);
   const [, setDesktopLyricsLocked] = useState(false);
   const [audioDrawerStatus, setAudioDrawerStatus] = useState<AudioStatus | null>(null);
   const [audioIssueDiagnosticsWindowEnabled, setAudioIssueDiagnosticsWindowEnabled] = useState(false);
   const [signalPathControlEnabled, setSignalPathControlEnabled] = useState(false);
   const [lyricsMiniPlayerSettings, setLyricsMiniPlayerSettings] = useState<LyricsMiniPlayerSettings>(defaultLyricsMiniPlayerSettings);
+  const [lyricsMiniPlayerSettingsReady, setLyricsMiniPlayerSettingsReady] = useState(false);
   const [sidebarLayoutSettings, setSidebarLayoutSettings] = useState<SidebarLayoutSettings>(defaultSidebarLayoutSettings);
-  const [featureCommentsHidden, setFeatureCommentsHidden] = useState(false);
   const [lyricsMiniPlayerCoverSample, setLyricsMiniPlayerCoverSample] = useState<ReadableColorSample | null>(null);
   const [isLyricsMiniPlayerAutoHidden, setIsLyricsMiniPlayerAutoHidden] = useState(false);
+  const [isLyricsMiniPlayerShortcutHidden, setIsLyricsMiniPlayerShortcutHidden] = useState(false);
   const [activeLyricsViewMode, setActiveLyricsViewMode] = useState<LyricsViewMode>(() => readRememberedLyricsViewMode());
   const lastDesktopLyricsForwardRef = useRef<string | null>(null);
 
@@ -756,16 +773,6 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
     window.addEventListener(lyricsDrawerToolsChangedEvent, handleLyricsDrawerToolsChanged);
     return () => window.removeEventListener(lyricsDrawerToolsChangedEvent, handleLyricsDrawerToolsChanged);
-  }, []);
-
-  useEffect(() => {
-    const handleOpenUserNotice = (): void => {
-      setUserNoticeSettingsLoaded(true);
-      setUserNoticeReviewOpen(true);
-    };
-
-    window.addEventListener(openUserNoticeEvent, handleOpenUserNotice);
-    return () => window.removeEventListener(openUserNoticeEvent, handleOpenUserNotice);
   }, []);
 
   useEffect(() => {
@@ -816,17 +823,46 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     playbackStatusSnapshot.playbackStatus,
   ]);
   const [appWallpaperSettings, setAppWallpaperSettings] = useState<AppWallpaperSettings>(defaultAppWallpaperSettings);
+  const [appWallpaperSettingsReady, setAppWallpaperSettingsReady] = useState(false);
   const [appAppearanceTheme, setAppAppearanceTheme] = useState<AppThemeMode>(() => readDocumentThemeMode());
   const [loadedAppWallpaperKey, setLoadedAppWallpaperKey] = useState<string | null>(null);
+  const [failedAppWallpaperKey, setFailedAppWallpaperKey] = useState<string | null>(null);
+  // Tagged with the wallpaper key it was measured for: a cached image can fire
+  // `load` before React's passive effects flush, so an untagged measurement
+  // would be wiped by the key-change reset and the framing would silently fall
+  // back to plain contain.
+  const [appWallpaperNatural, setAppWallpaperNatural] = useState<{ key: string; w: number; h: number } | null>(null);
+  const [appWallpaperViewportSize, setAppWallpaperViewportSize] = useState<{ w: number; h: number }>(() => ({
+    w: window.innerWidth,
+    h: window.innerHeight,
+  }));
   const [isAppWallpaperDocumentHidden, setIsAppWallpaperDocumentHidden] = useState(() => document.visibilityState === 'hidden');
   const [isAppWallpaperBlurPaused, setIsAppWallpaperBlurPaused] = useState(false);
   const [isAppWallpaperPortraitViewport, setIsAppWallpaperPortraitViewport] = useState(() => isPortraitViewport());
   const [isWindowFocused, setIsWindowFocused] = useState(() => document.hasFocus());
   const appWallpaperVideoRef = useRef<HTMLVideoElement | null>(null);
+  const appWallpaperImageRef = useRef<HTMLImageElement | null>(null);
   const appWallpaperBlurTimerRef = useRef<number | null>(null);
   const fullscreenTransitionTimerRef = useRef<number | null>(null);
   const fullscreenTransitionStartedAtRef = useRef(0);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!appWallpaperSettingsReady || appWallpaperSettings.lowSpecModeEnabled) {
+      return undefined;
+    }
+
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    if (!idleWindow.requestIdleCallback) {
+      return undefined;
+    }
+
+    const handle = idleWindow.requestIdleCallback(preloadSettingsRoute, { timeout: 8_000 });
+    return () => idleWindow.cancelIdleCallback?.(handle);
+  }, [appWallpaperSettings.lowSpecModeEnabled, appWallpaperSettingsReady, preloadSettingsRoute]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lyricsMiniPlayerHostRef = useRef<HTMLDivElement | null>(null);
   const lyricsMiniPlayerAutoHideTimerRef = useRef<number | null>(null);
@@ -841,13 +877,15 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const activeRouteIdRef = useRef<AppRouteId>(activeRouteId);
   const downloadImportedTrackIdsRef = useRef<Map<string, string | null>>(new Map());
   const downloadLibraryChangedTimerRef = useRef<number | null>(null);
-  const availableRoutes = useMemo(() => [...routes, ...pluginPanelRoutes], [pluginPanelRoutes, routes]);
+  const availableRoutes = useMemo(
+    () => [...routes, ...pluginPanelRoutes].filter((route) => route.id !== 'downloads' || musicDownloadsEnabled),
+    [pluginPanelRoutes, routes],
+  );
 
   const visibleRoutes = useMemo(
     () =>
       applySidebarPreferences(
         availableRoutes.map((route) => (
-          (route.id === 'downloads' && !downloadsFeatureUnlocked) ||
           (route.id === 'streaming' && !streamingFeatureEnabled) ||
           (route.id === 'osu-downloader' && !osuDownloaderFeatureEnabled)
             ? { ...route, hideFromSidebar: true }
@@ -855,7 +893,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         )),
         sidebarLayoutSettings,
       ),
-    [availableRoutes, downloadsFeatureUnlocked, osuDownloaderFeatureEnabled, sidebarLayoutSettings, streamingFeatureEnabled],
+    [availableRoutes, osuDownloaderFeatureEnabled, sidebarLayoutSettings, streamingFeatureEnabled],
   );
   const sidebarRouteById = useMemo(() => new Map(availableRoutes.map((route) => [route.id, route])), [availableRoutes]);
 
@@ -914,36 +952,19 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     [persistSidebarLayoutPatch, sidebarLayoutSettings.sidebarHiddenRouteIds, sidebarLayoutSettings.sidebarRouteOrder, sidebarRouteById],
   );
 
-  const refreshConnectFeatureUnlock = useCallback((): void => {
-    const getEchoProAccountStatus = window.echo?.app?.getEchoProAccountStatus;
-    if (!getEchoProAccountStatus) {
-      return;
-    }
-
-    void getEchoProAccountStatus()
-      .then((status) => {
-        const unlocked = status.pro === true;
-        setConnectDonatorUnlocked(unlocked);
-      })
-      .catch(() => setConnectDonatorUnlocked(false));
-  }, []);
-
   const refreshPluginPanelRoutes = useCallback((): void => {
     const listPlugins = window.echo?.plugins?.list;
     if (!listPlugins) {
       setPluginPanelRoutes([]);
-      setEchoProPluginUnlocked(false);
       return;
     }
 
     void listPlugins()
       .then((result) => {
         setPluginPanelRoutes(createPluginPanelRoutes(result.plugins));
-        setEchoProPluginUnlocked(result.plugins.some(isEchoProUnlockPluginActive));
       })
       .catch(() => {
-        setPluginPanelRoutes([]);
-        setEchoProPluginUnlocked(false);
+        // A failed refresh is not an authoritative entitlement revocation.
       });
   }, []);
 
@@ -976,11 +997,10 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const navigableRoutes = useMemo(
     () =>
       availableRoutes.filter((route) =>
-        (route.id !== 'downloads' || downloadsFeatureUnlocked) &&
         (route.id !== 'streaming' || streamingFeatureEnabled) &&
         (route.id !== 'osu-downloader' || osuDownloaderFeatureEnabled),
       ),
-    [availableRoutes, downloadsFeatureUnlocked, osuDownloaderFeatureEnabled, streamingFeatureEnabled],
+    [availableRoutes, osuDownloaderFeatureEnabled, streamingFeatureEnabled],
   );
   const activeRoute = useMemo(
     () => navigableRoutes.find((route) => route.id === activeRouteId) ?? navigableRoutes[0] ?? availableRoutes[0],
@@ -1012,6 +1032,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
     return nextRoutes;
   }, [activeRoute, mountedPersistentRouteIds, navigableRoutes]);
+
   const isStandaloneRoute = activeRoute.chrome === 'standalone';
   const isLyricsRoute = activeRouteId === 'lyrics';
   useEffect(() => {
@@ -1020,16 +1041,22 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     }
   }, [isLyricsRoute, isLyricsVisualDrawerOpen]);
   const shouldRenderDragDropImportOverlay = !isStandaloneRoute && activeRouteId !== 'plugins';
-  const shouldRenderUserNoticeGate = userNoticeReviewOpen || (userNoticeSettingsLoaded && !userNoticeAccepted);
-  const shouldRenderFirstRunWizard = !shouldRenderUserNoticeGate && (isFirstRunWizardOpen || isFirstRunWizardClosing);
+  const shouldRenderFirstRunWizard = isFirstRunWizardOpen || isFirstRunWizardClosing;
   const shouldUseLyricsPlayerDrawer =
     isLyricsRoute &&
     (lyricsMiniPlayerSettings.lyricsPlayerBarDrawerEnabled === true ||
       (activeLyricsViewMode === 'mv' && lyricsMiniPlayerSettings.lyricsPlayerBarDrawerAutoEnableForMv !== false));
+  const isLyricsMiniPlayerShortcutModeActive =
+    shouldUseLyricsPlayerDrawer &&
+    lyricsMiniPlayerSettings.lyricsPlayerBarDrawerShortcutEnabled === true &&
+    Boolean(lyricsMiniPlayerSettings.lyricsPlayerBarDrawerShortcutAccelerator);
   const shouldAutoHideLyricsMiniPlayer =
-    shouldUseLyricsPlayerDrawer && lyricsMiniPlayerSettings.lyricsPlayerBarDrawerAutoHideEnabled === true;
+    shouldUseLyricsPlayerDrawer &&
+    !isLyricsMiniPlayerShortcutModeActive &&
+    lyricsMiniPlayerSettings.lyricsPlayerBarDrawerAutoHideEnabled === true;
   const isLyricsMiniPlayerVisuallyHidden =
-    shouldAutoHideLyricsMiniPlayer && isLyricsMiniPlayerAutoHidden && !isLyricsQueueDrawerOpen;
+    (shouldAutoHideLyricsMiniPlayer && isLyricsMiniPlayerAutoHidden && !isLyricsQueueDrawerOpen) ||
+    (isLyricsMiniPlayerShortcutModeActive && isLyricsMiniPlayerShortcutHidden);
   const shouldRenderPlayerBar = !isStandaloneRoute || isLyricsRoute;
   const hasDesktopLyricsBridge = Boolean(window.echo?.desktopLyrics);
   const currentMiniPlayerTrack = playbackQueue.currentTrack ?? playbackQueue.lastPlayedTrack ?? null;
@@ -1047,39 +1074,106 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         ? tintedMiniPlayerRgb(lyricsMiniPlayerCoverSample)
         : colorMode === 'custom'
           ? customRgb
-          : fallbackRgb;
+          : colorMode === 'light'
+            ? miniPlayerLightSurface
+            : fallbackRgb;
     const channels = formatRgbChannels(rgb);
+    const effectiveTheme =
+      appAppearanceTheme === 'system' ? document.documentElement.dataset.theme : appAppearanceTheme;
+    const backdropRgb =
+      effectiveTheme === 'dark' || effectiveTheme === 'ambient' ? miniPlayerDarkBackdrop : miniPlayerLightBackdrop;
+    const borderColor =
+      colorMode === 'light'
+        ? `rgba(17, 24, 39, ${Math.max(0.1, opacity * 0.14).toFixed(2)})`
+        : `rgba(255, 255, 255, ${Math.max(0.08, opacity * 0.2).toFixed(2)})`;
 
     return {
       '--lyrics-mini-player-opacity': opacity.toFixed(2),
       '--lyrics-mini-player-visual-opacity': miniPlayerVisualOpacity(opacity).toFixed(2),
       '--lyrics-mini-player-background': `rgba(${channels}, ${opacity.toFixed(2)})`,
-      '--lyrics-mini-player-border': `rgba(255, 255, 255, ${Math.max(0.08, opacity * 0.2).toFixed(2)})`,
-      ...getMiniPlayerReadablePalette(rgb),
+      '--lyrics-mini-player-border': borderColor,
+      ...getMiniPlayerReadablePalette(rgb, opacity, backdropRgb),
     } as CSSProperties;
   }, [
     lyricsMiniPlayerCoverSample,
     lyricsMiniPlayerSettings.lyricsPlayerBarDrawerColor,
     lyricsMiniPlayerSettings.lyricsPlayerBarDrawerColorMode,
     lyricsMiniPlayerSettings.lyricsPlayerBarDrawerOpacityPercent,
+    appAppearanceTheme,
   ]);
-  const activeAppWallpaperPath = isAppWallpaperPortraitViewport
-    ? appWallpaperSettings.appPortraitWallpaperPath ?? null
+  const usesPortraitAppWallpaperOverride = Boolean(
+    isAppWallpaperPortraitViewport && appWallpaperSettings.appPortraitWallpaperPath,
+  );
+  const activeAppWallpaperPath = usesPortraitAppWallpaperOverride
+    ? appWallpaperSettings.appPortraitWallpaperPath
     : appWallpaperSettings.appCustomWallpaperPath;
-  const activeAppWallpaperMediaType = isAppWallpaperPortraitViewport
+  const activeAppWallpaperMediaType = usesPortraitAppWallpaperOverride
     ? appWallpaperSettings.appPortraitWallpaperMediaType ?? inferAppWallpaperMediaType(activeAppWallpaperPath)
     : appWallpaperSettings.appWallpaperMediaType ?? inferAppWallpaperMediaType(activeAppWallpaperPath);
+  const performancePolicy = resolveEffectivePerformancePolicy(appWallpaperSettings);
   const activeAppWallpaperOrientation = isAppWallpaperPortraitViewport ? 'portrait' : 'landscape';
+  // Each wallpaper slot carries its own layout mode and framing: the two
+  // pictures have different shapes, so one slot's crop can never describe the
+  // other's.
+  const activeAppWallpaperFitMode = usesPortraitAppWallpaperOverride
+    ? appWallpaperSettings.appPortraitWallpaperFitMode ?? 'fill'
+    : appWallpaperSettings.appWallpaperFitMode ?? 'fill';
+  const activeAppWallpaperPosition = usesPortraitAppWallpaperOverride
+    ? appWallpaperSettings.appPortraitWallpaperPosition ?? null
+    : appWallpaperSettings.appWallpaperPosition ?? null;
   const isAmbientThemeActive = appAppearanceTheme === 'ambient';
   const appWallpaperUrl = !isAmbientThemeActive && activeAppWallpaperPath
-    ? `echo-wallpaper://${isAppWallpaperPortraitViewport ? 'app-portrait' : 'app'}/custom?path=${encodeURIComponent(activeAppWallpaperPath)}`
+    ? `echo-wallpaper://${usesPortraitAppWallpaperOverride ? 'app-portrait' : 'app'}/custom?path=${encodeURIComponent(activeAppWallpaperPath)}`
     : null;
-  const shouldShowAppWallpaperVisual = Boolean(appWallpaperUrl && !isLyricsRoute);
   const isAppWallpaperVideo = activeAppWallpaperMediaType === 'video';
-  const appWallpaperKey = appWallpaperUrl
+  const shouldMountAppWallpaperMedia = Boolean(
+    appWallpaperUrl && (!isAppWallpaperVideo || performancePolicy.allowVideoWallpaper),
+  );
+  const shouldShowAppWallpaperVisual = Boolean(
+    shouldMountAppWallpaperMedia && !isLyricsRoute,
+  );
+
+  const handleSidebarRouteShow = useCallback(
+    (routeId: SidebarRouteId): void => {
+      persistSidebarLayoutPatch({
+        sidebarRouteOrder: normalizeSidebarRouteOrder(sidebarLayoutSettings.sidebarRouteOrder),
+        sidebarHiddenRouteIds: normalizeSidebarHiddenRouteIds(
+          normalizeSidebarHiddenRouteIds(sidebarLayoutSettings.sidebarHiddenRouteIds).filter((hiddenRouteId) => hiddenRouteId !== routeId),
+        ),
+      });
+    },
+    [persistSidebarLayoutPatch, sidebarLayoutSettings.sidebarHiddenRouteIds, sidebarLayoutSettings.sidebarRouteOrder],
+  );
+
+  const handleSidebarIconOnlyToggle = useCallback((): void => {
+    const nextSettings: Pick<SidebarLayoutSettings, 'sidebarAutoHideEnabled' | 'sidebarIconOnlyEnabled'> = {
+      sidebarAutoHideEnabled: false,
+      sidebarIconOnlyEnabled: !sidebarLayoutSettings.sidebarIconOnlyEnabled,
+    };
+
+    setSidebarLayoutSettings((current) => ({
+      ...current,
+      ...nextSettings,
+    }));
+
+    void window.echo?.app?.setSettings?.(nextSettings)
+      .then((settings) => {
+        window.dispatchEvent(new CustomEvent('settings:changed', { detail: settings }));
+      })
+      .catch(() => undefined);
+  }, [sidebarLayoutSettings.sidebarIconOnlyEnabled]);
+  const appWallpaperKey = appWallpaperUrl && shouldMountAppWallpaperMedia
     ? `${activeAppWallpaperOrientation}:${activeAppWallpaperMediaType}:${appWallpaperUrl}`
     : null;
   const isAppWallpaperReady = Boolean(appWallpaperKey && loadedAppWallpaperKey === appWallpaperKey);
+  const hasAppWallpaperLoadError = Boolean(appWallpaperKey && failedAppWallpaperKey === appWallpaperKey);
+  const appWallpaperNaturalSize = useMemo(
+    () =>
+      appWallpaperNatural && appWallpaperNatural.key === appWallpaperKey
+        ? { w: appWallpaperNatural.w, h: appWallpaperNatural.h }
+        : null,
+    [appWallpaperNatural, appWallpaperKey],
+  );
   const shouldPauseAppWallpaperVideo = Boolean(
     isAppWallpaperVideo &&
     appWallpaperUrl &&
@@ -1097,27 +1191,109 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     appWallpaperRawUiAlpha <= 0;
   const isAppWallpaperUiZero = isAppWallpaperReady && appWallpaperRawUiAlpha <= 0;
   const appWallpaperStyle = useMemo<CSSProperties>(() => {
-    const blurPx = isAppWallpaperVideo
-      ? Math.min(appWallpaperSettings.appWallpaperBlurPx, 12)
-      : appWallpaperSettings.appWallpaperBlurPx;
+    const blurPx = performancePolicy.appWallpaperBlurPx;
     const brightnessPercent = appWallpaperSettings.appWallpaperBrightnessPercent;
-    const baseScale = appWallpaperSettings.appWallpaperScalePercent / 100;
-    const blurOverscanScale = blurPx > 0 ? Math.min(0.18, blurPx * 0.004) : 0;
     const filterParts = [
       blurPx > 0 ? `blur(${blurPx}px)` : null,
       brightnessPercent !== 100 ? `brightness(${brightnessPercent}%)` : null,
     ].filter(Boolean);
+    const filter = filterParts.length ? filterParts.join(' ') : 'none';
 
+    // Framing-aware rendering, mirroring the standalone background page: only
+    // the 'fit' layout applies the committed fractional center + zoom (on the
+    // contain base); every other mode arranges the picture itself. The size
+    // guard keeps a framing made for one picture from leaking onto a replaced
+    // one.
+    const fitMode = activeAppWallpaperFitMode;
+    if (
+      fitMode === 'fit' &&
+      appWallpaperNaturalSize &&
+      activeAppWallpaperPosition &&
+      activeAppWallpaperPosition.iw === appWallpaperNaturalSize.w &&
+      activeAppWallpaperPosition.ih === appWallpaperNaturalSize.h
+    ) {
+      const position = activeAppWallpaperPosition;
+      const { w: vw, h: vh } = appWallpaperViewportSize;
+      const { w: iw, h: ih } = appWallpaperNaturalSize;
+      const baseScale = Math.min(vw / iw, vh / ih);
+      const zoom = Number.isFinite(position.zoom) ? position.zoom : 1;
+      const width = iw * baseScale * zoom;
+      const height = ih * baseScale * zoom;
+      const cx = position.x * vw;
+      const cy = position.y * vh;
+      return {
+        filter,
+        position: 'absolute',
+        left: `${(cx - width / 2).toFixed(2)}px`,
+        top: `${(cy - height / 2).toFixed(2)}px`,
+        width: `${width.toFixed(2)}px`,
+        height: `${height.toFixed(2)}px`,
+        objectFit: 'fill',
+        transform: 'none',
+      };
+    }
+
+    // The framing zoom is a fit-mode concept: other layouts arrange the picture
+    // themselves and must not inherit it (see the standalone background page).
+    const baseScale = fitMode === 'fit' ? appWallpaperSettings.appWallpaperScalePercent / 100 : 1;
+    const blurOverscanScale = blurPx > 0 ? Math.min(0.18, blurPx * 0.004) : 0;
+    const objectFitMap: Record<string, CSSProperties['objectFit']> = {
+      fill: 'cover',
+      stretch: 'fill',
+      fit: 'contain',
+      center: 'none',
+      tile: 'cover',
+    };
+    // Tile mode paints the layer itself: a repeated background is the only way
+    // to reproduce the reference page's tiling (object-fit cannot repeat), so
+    // the media element is hidden and the layer shows the tiles. Videos keep
+    // the cover fallback above.
+    const isAppWallpaperTiled =
+      fitMode === 'tile' && !isAppWallpaperVideo;
     return {
-      filter: filterParts.length ? filterParts.join(' ') : 'none',
+      filter,
       transform: `scale(${(baseScale + blurOverscanScale).toFixed(3)})`,
+      objectFit: objectFitMap[fitMode] ?? 'cover',
+      ...(isAppWallpaperTiled ? { visibility: 'hidden' as const } : null),
     };
   }, [
-    appWallpaperSettings.appWallpaperBlurPx,
+    isAppWallpaperVideo,
+    performancePolicy.appWallpaperBlurPx,
     appWallpaperSettings.appWallpaperBrightnessPercent,
+    activeAppWallpaperFitMode,
     appWallpaperSettings.appWallpaperScalePercent,
+    activeAppWallpaperPosition,
+    appWallpaperNaturalSize,
+    appWallpaperViewportSize,
+  ]);
+
+  const appWallpaperLayerStyle = useMemo<CSSProperties>(() => {
+    // Opacity lives on the layer (not the media element) so one value covers
+    // every layout, including tile mode where the layer paints the picture.
+    // A CSS variable is used instead of `opacity` so the hidden state's
+    // `opacity: 0` rule still wins over it.
+    const style = {
+      '--app-wallpaper-opacity': String(
+        Math.max(0, Math.min(1, (appWallpaperSettings.appWallpaperOpacityPercent ?? 100) / 100)),
+      ),
+    } as CSSProperties;
+    if (activeAppWallpaperFitMode !== 'tile' || isAppWallpaperVideo || !appWallpaperUrl) {
+      return style;
+    }
+    return {
+      ...style,
+      backgroundImage: `url(${JSON.stringify(appWallpaperUrl)})`,
+      backgroundRepeat: 'repeat',
+      backgroundSize: 'auto',
+      backgroundPosition: '0 0',
+    };
+  }, [
+    activeAppWallpaperFitMode,
+    appWallpaperSettings.appWallpaperOpacityPercent,
+    appWallpaperUrl,
     isAppWallpaperVideo,
   ]);
+
   const appShellStyle = useMemo(() => {
     const uiAlpha =
       isAppWallpaperReady && appWallpaperSettings.appWallpaperVisualProtectionEnabled
@@ -1267,35 +1443,11 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     let cancelled = false;
 
     const applyFirstRunSettings = (settings: Partial<AppSettings> | null | undefined): void => {
-      if (
-        !settings ||
-        (!Object.prototype.hasOwnProperty.call(settings, 'onboardingCompleted') &&
-          !Object.prototype.hasOwnProperty.call(settings, 'userNoticeAcceptedVersion'))
-      ) {
+      if (!settings || !Object.prototype.hasOwnProperty.call(settings, 'onboardingCompleted')) {
         return;
       }
 
       setFirstRunSettings((current) => ({ ...(current ?? {}), ...settings }) as AppSettings);
-      const hasUserNoticeAcceptedVersion = Object.prototype.hasOwnProperty.call(settings, 'userNoticeAcceptedVersion');
-      let nextUserNoticeAccepted = userNoticeAccepted;
-      if (hasUserNoticeAcceptedVersion) {
-        nextUserNoticeAccepted = settings.userNoticeAcceptedVersion === currentUserNoticeVersion;
-      } else if (settings.onboardingCompleted === true) {
-        nextUserNoticeAccepted = true;
-      }
-      if (hasUserNoticeAcceptedVersion) {
-        setUserNoticeAccepted(nextUserNoticeAccepted);
-        setUserNoticeSettingsLoaded(true);
-      } else if (settings.onboardingCompleted === true) {
-        setUserNoticeAccepted(true);
-        setUserNoticeSettingsLoaded(true);
-      }
-
-      if (!nextUserNoticeAccepted) {
-        closeFirstRunWizard();
-        return;
-      }
-
       if (settings.onboardingCompleted === false) {
         openFirstRunWizard();
       } else {
@@ -1331,7 +1483,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       cancelled = true;
       window.removeEventListener('settings:changed', handleSettingsChanged);
     };
-  }, [closeFirstRunWizard, openFirstRunWizard, userNoticeAccepted]);
+  }, [closeFirstRunWizard, openFirstRunWizard]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1341,20 +1493,12 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         return;
       }
 
-      if (Object.prototype.hasOwnProperty.call(settings, 'downloadsFeatureUnlocked')) {
-        setDownloadsFeatureUnlocked(settings.downloadsFeatureUnlocked === true);
-      }
-
       if (Object.prototype.hasOwnProperty.call(settings, 'streamingFeatureEnabled')) {
         setStreamingFeatureEnabled(settings.streamingFeatureEnabled === true);
       }
 
       if (Object.prototype.hasOwnProperty.call(settings, 'osuDownloaderFeatureEnabled')) {
         setOsuDownloaderFeatureEnabled(settings.osuDownloaderFeatureEnabled === true);
-      }
-
-      if (Object.prototype.hasOwnProperty.call(settings, 'featureCommentsHidden')) {
-        setFeatureCommentsHidden(settings.featureCommentsHidden === true);
       }
 
       if (Object.prototype.hasOwnProperty.call(settings, 'appearanceTheme')) {
@@ -1488,15 +1632,13 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   }, []);
 
   useEffect(() => {
-    refreshConnectFeatureUnlock();
     refreshPluginPanelRoutes();
     const handlePluginsChanged = (): void => {
-      refreshConnectFeatureUnlock();
       refreshPluginPanelRoutes();
       window.dispatchEvent(new Event('settings:changed'));
     };
     const handleEchoProStatusChanged = (): void => {
-      refreshConnectFeatureUnlock();
+      refreshPluginPanelRoutes();
       window.dispatchEvent(new Event('settings:changed'));
     };
     window.addEventListener('plugins:changed', handlePluginsChanged);
@@ -1505,7 +1647,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       window.removeEventListener('plugins:changed', handlePluginsChanged);
       window.removeEventListener('echo-pro:status-changed', handleEchoProStatusChanged);
     };
-  }, [refreshConnectFeatureUnlock, refreshPluginPanelRoutes]);
+  }, [refreshPluginPanelRoutes]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1567,6 +1709,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   useEffect(() => {
     const syncWallpaperOrientation = (): void => {
       setIsAppWallpaperPortraitViewport(isPortraitViewport());
+      setAppWallpaperViewportSize({ w: window.innerWidth, h: window.innerHeight });
     };
 
     syncWallpaperOrientation();
@@ -1582,11 +1725,32 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   useEffect(() => {
     if (!appWallpaperKey) {
       setLoadedAppWallpaperKey(null);
+      setFailedAppWallpaperKey(null);
       return;
     }
 
     setLoadedAppWallpaperKey((current) => (current === appWallpaperKey ? current : null));
+    setFailedAppWallpaperKey((current) => (current === appWallpaperKey ? current : null));
   }, [appWallpaperKey]);
+
+  // The media element can finish loading before React's passive effects flush —
+  // a cached picture, or a src that never changed (portrait toggle with no
+  // portrait wallpaper). Re-read the live element on every key change so the
+  // framing always has the dimensions it is about to be applied against.
+  useEffect(() => {
+    if (!appWallpaperKey) {
+      return;
+    }
+    const media = isAppWallpaperVideo ? appWallpaperVideoRef.current : appWallpaperImageRef.current;
+    if (!media) {
+      return;
+    }
+    const w = media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+    const h = media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+    if (w > 0 && h > 0) {
+      setAppWallpaperNatural({ key: appWallpaperKey, w, h });
+    }
+  }, [appWallpaperKey, isAppWallpaperVideo]);
 
   useEffect(() => {
     const handleVisibilityChange = (): void => {
@@ -1712,6 +1876,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const navigateRoute = useCallback(
     (routeId: AppRouteId, trigger = 'navigateRoute'): void => {
       const nextRouteId =
+        (routeId === 'downloads' && !musicDownloadsEnabled) ||
         (routeId === 'streaming' && !streamingFeatureEnabled) ||
         (routeId === 'osu-downloader' && !osuDownloaderFeatureEnabled)
           ? readFallbackRouteId(routes)
@@ -1731,6 +1896,9 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
       if (nextRouteId === 'lyrics' && activeRouteId !== 'lyrics') {
         previousRouteIdRef.current = activeRouteId;
+        setMountedPersistentRouteIds((current) => (
+          current.includes(activeRouteId) ? current : [...current, activeRouteId]
+        ));
       }
 
       if (nextRouteId !== 'lyrics') {
@@ -1739,12 +1907,9 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
       beginRouteSwitchTrace(nextRouteId, nextTrigger);
       const commitActiveRoute = (): void => setActiveRouteId(nextRouteId);
-      if (nextRouteId === 'lyrics' || activeRouteId === 'lyrics') {
-        startTransition(commitActiveRoute);
-        return;
-      }
-
-      commitActiveRoute();
+      // Keep the current page visible while a lazy route chunk is loading.
+      // This avoids replacing a usable screen with the global loading card.
+      startTransition(commitActiveRoute);
     },
     [activeRouteId, beginRouteSwitchTrace, getRouteSwitchPlaybackDetails, osuDownloaderFeatureEnabled, routes, streamingFeatureEnabled],
   );
@@ -1780,12 +1945,6 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
     routeSwitchCommittedRouteIdRef.current = activeRouteId;
   }, [activeRouteId, getRouteSwitchPlaybackDetails]);
-
-  useEffect(() => {
-    if (!downloadsFeatureUnlocked && activeRouteId === 'downloads') {
-      navigateRoute('songs', 'downloads-locked');
-    }
-  }, [activeRouteId, downloadsFeatureUnlocked, navigateRoute]);
 
   useEffect(() => {
     if (!navigableRoutes.some((route) => route.id === activeRouteId) && activeRoute?.id && activeRoute.id !== activeRouteId) {
@@ -1867,10 +2026,10 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const clearNotificationNotices = useCallback((): void => {
     setChromeNotice(null);
     setIsChromeNoticeVisible(false);
-    setAccountNotice(null);
     setUpcomingTrackNotice(null);
     setIsUpcomingTrackNoticeVisible(false);
     setAudioErrorNotice(null);
+    setAudioComponentNotice(false);
     setDiagnosticsNotice(false);
     setMemoryPressureNotice(null);
   }, []);
@@ -1885,40 +2044,104 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     setIsChromeNoticeVisible(true);
   }, []);
 
-  const showAudioErrorNotice = useCallback((rawError: string): void => {
-    if (notificationsDisabledRef.current) {
-      return;
-    }
+  const showAudioErrorNotice = useCallback(
+    (rawError: string, source: 'playback-status' | 'event' = 'playback-status'): void => {
+      if (notificationsDisabledRef.current) {
+        return;
+      }
 
-    if (!rawError || rawError === 'Desktop bridge unavailable') {
-      return;
-    }
+      if (!rawError || rawError === 'Desktop bridge unavailable') {
+        return;
+      }
 
-    if (isSpotifyPlaybackSetupError(rawError)) {
-      return;
-    }
+      if (isSpotifyPlaybackSetupError(rawError)) {
+        return;
+      }
 
-    if (shouldSuppressAudioHostError(rawError)) {
-      return;
-    }
+      if (isMissingAudioRuntimeComponentError(rawError)) {
+        if (lastAudioErrorRef.current !== rawError) {
+          lastAudioErrorRef.current = rawError;
+          setAudioErrorNotice(null);
+          setAudioComponentNotice(true);
+        }
+        return;
+      }
 
-    if (lastAudioErrorRef.current === rawError) {
-      return;
-    }
+      if (shouldSuppressAudioHostError(rawError)) {
+        return;
+      }
 
-    lastAudioErrorRef.current = rawError;
-    setAudioErrorNotice({
-      message: formatAudioHostError(rawError) ?? rawError,
-    });
-  }, []);
+      if (lastAudioErrorRef.current === rawError) {
+        return;
+      }
+
+      lastAudioErrorRef.current = rawError;
+      setAudioErrorNotice({
+        message:
+          formatAudioHostError(rawError) ??
+          formatUserFacingError(rawError, { context: 'audio' }),
+        rawError,
+        source,
+      });
+    },
+    [],
+  );
+
+  const handleOpenAudioComponentDownloadPage = useCallback(async (): Promise<void> => {
+    setAudioComponentActionBusy(true);
+    try {
+      await window.echo?.app?.openRuntimeAudioComponentDownloadPage?.();
+    } catch (error) {
+      showChromeNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAudioComponentActionBusy(false);
+    }
+  }, [showChromeNotice]);
+
+  const handleImportAudioComponent = useCallback(async (): Promise<void> => {
+    setAudioComponentActionBusy(true);
+    try {
+      const result = await window.echo?.app?.importRuntimeAudioComponent?.();
+      if (result?.outcome === 'installed') {
+        setAudioComponentNotice(false);
+        lastAudioErrorRef.current = null;
+        showChromeNotice(t('notice.audioComponent.installed'));
+      }
+    } catch (error) {
+      showChromeNotice(t('notice.audioComponent.importFailed', {
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setAudioComponentActionBusy(false);
+    }
+  }, [showChromeNotice, t]);
 
   useEffect(() => {
     activeRouteIdRef.current = activeRouteId;
 
-    if (persistentRouteIds.has(activeRouteId)) {
-      setMountedPersistentRouteIds((current) => (current.includes(activeRouteId) ? current : [...current, activeRouteId]));
-    }
-  }, [activeRouteId]);
+    setMountedPersistentRouteIds((current) => {
+      if (appWallpaperSettings.lowSpecModeEnabled) {
+        const next = current.filter((routeId) => (
+          routeId === activeRouteId ||
+          (activeRouteId === 'lyrics' && routeId === previousRouteIdRef.current)
+        ));
+
+        return persistentRouteIds.has(activeRouteId) && !next.includes(activeRouteId)
+          ? [...next, activeRouteId]
+          : next;
+      }
+
+      const next = current.filter((routeId) => (
+        persistentRouteIds.has(routeId) ||
+        routeId === activeRouteId ||
+        (activeRouteId === 'lyrics' && routeId === previousRouteIdRef.current)
+      ));
+
+      return persistentRouteIds.has(activeRouteId) && !next.includes(activeRouteId)
+        ? [...next, activeRouteId]
+        : next;
+    });
+  }, [activeRouteId, appWallpaperSettings.lowSpecModeEnabled]);
 
   useEffect(() => {
     const folderInput = folderInputRef.current;
@@ -2023,12 +2246,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       lastUpcomingTrackNoticeKeyRef.current = null;
     }
 
-    const upcomingItem = resolveUpcomingQueueItem(
-      playbackQueue.items,
-      playbackQueue.currentQueueId,
-      clock.trackId ?? playbackQueue.currentTrackId,
-      playbackQueue.repeatMode,
-    );
+    const upcomingItem = playbackQueue.upcomingItem;
     if (!upcomingItem) {
       return;
     }
@@ -2046,22 +2264,9 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   }, [
     playbackQueue.currentQueueId,
     playbackQueue.currentTrackId,
-    playbackQueue.items,
-    playbackQueue.repeatMode,
+    playbackQueue.upcomingItem,
     playbackStatusSnapshot,
   ]);
-
-  useEffect(() => {
-    if (!accountNotice) {
-      return undefined;
-    }
-
-    const timer = window.setTimeout(() => {
-      setAccountNotice(null);
-    }, 6200);
-
-    return () => window.clearTimeout(timer);
-  }, [accountNotice]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2069,14 +2274,6 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     const applySettings = (settings: Partial<AppSettings> | null | undefined): void => {
       if (!settings) {
         return;
-      }
-
-      if (Object.prototype.hasOwnProperty.call(settings, 'suppressAccountExpiryNotices')) {
-        const suppressed = readSuppressAccountExpiryNotices(settings);
-        suppressAccountExpiryNoticesRef.current = suppressed;
-        if (suppressed) {
-          setAccountNotice(null);
-        }
       }
 
       if (Object.prototype.hasOwnProperty.call(settings, 'notificationsDisabled')) {
@@ -2128,25 +2325,6 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   }, [clearNotificationNotices]);
 
   useEffect(() => {
-    const unsubscribe = window.echo?.accounts?.onStatusesChanged?.((statuses: AccountStatus[]) => {
-      if (notificationsDisabledRef.current || suppressAccountExpiryNoticesRef.current) {
-        return;
-      }
-
-      const disconnected = statuses.filter((status) => !status.connected && Boolean(status.error));
-
-      if (disconnected.length === 0) {
-        return;
-      }
-
-      const names = disconnected.map((status) => t(accountProviderLabelKeys[status.provider] ?? 'accountProvider.unknown'));
-      setAccountNotice(t('notice.accountExpired', { names: names.join(t('punctuation.listSeparator')) }));
-    });
-
-    return () => unsubscribe?.();
-  }, [t]);
-
-  useEffect(() => {
     const rawError = playbackStatusSnapshot.audioStatus?.error ?? playbackStatusSnapshot.error;
     if (rawError) {
       showAudioErrorNotice(rawError);
@@ -2157,7 +2335,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     const handleShowAudioErrorNotice = (event: Event): void => {
       const message = readAudioErrorNoticeMessage(event);
       if (message) {
-        showAudioErrorNotice(message);
+        showAudioErrorNotice(message, 'event');
       }
     };
 
@@ -2188,7 +2366,12 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     const rawError = playbackStatusSnapshot.audioStatus?.error ?? playbackStatusSnapshot.error;
     const latestState = playbackStatusSnapshot.audioStatus?.state ?? playbackStatusSnapshot.playbackStatus?.state ?? null;
 
-    if (rawError || !audioErrorNotice || latestState === 'error') {
+    if (
+      rawError ||
+      !audioErrorNotice ||
+      audioErrorNotice.source !== 'playback-status' ||
+      latestState === 'error'
+    ) {
       return;
     }
 
@@ -2208,7 +2391,10 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
     }
 
     const timer = window.setTimeout(() => {
-      setAudioErrorNotice(null);
+      if (lastAudioErrorRef.current === audioErrorNotice.rawError) {
+        lastAudioErrorRef.current = null;
+      }
+      setAudioErrorNotice((current) => (current === audioErrorNotice ? null : current));
     }, 5000);
 
     return () => window.clearTimeout(timer);
@@ -2249,7 +2435,10 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       }
 
       setAvailableUpdateStatus(status);
-      setIsUpdateNoticeVisible(true);
+      if (!hasShownUpdateNoticeRef.current) {
+        hasShownUpdateNoticeRef.current = true;
+        setIsUpdateNoticeVisible(true);
+      }
     };
 
     const unsubscribe = window.echo?.app?.onUpdateStatus?.(notifyUpdateStatus);
@@ -2257,6 +2446,18 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
     return () => unsubscribe?.();
   }, []);
+
+  useEffect(() => {
+    if (!isUpdateNoticeVisible || notificationsDisabled) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setIsUpdateNoticeVisible(false);
+    }, updateNoticeAutoHideMs);
+
+    return () => window.clearTimeout(timer);
+  }, [isUpdateNoticeVisible, notificationsDisabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2268,6 +2469,8 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         ('lyricsPlayerBarDrawerEnabled' in patch ||
           'lyricsPlayerBarDrawerAutoEnableForMv' in patch ||
           'lyricsPlayerBarDrawerAutoHideEnabled' in patch ||
+          'lyricsPlayerBarDrawerShortcutEnabled' in patch ||
+          'lyricsPlayerBarDrawerShortcutAccelerator' in patch ||
           'lyricsPlayerBarDrawerCompactOnIdleEnabled' in patch ||
           'lyricsPlayerBarDrawerOpacityPercent' in patch ||
           'lyricsPlayerBarDrawerColorMode' in patch ||
@@ -2277,16 +2480,24 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         return;
       }
 
-      void window.echo?.app
-        ?.getSettings?.()
+      const getSettings = window.echo?.app?.getSettings;
+      if (typeof getSettings !== 'function') {
+        setLyricsMiniPlayerSettings(defaultLyricsMiniPlayerSettings);
+        setLyricsMiniPlayerSettingsReady(true);
+        return;
+      }
+
+      void getSettings()
         .then((settings) => {
           if (!cancelled) {
             setLyricsMiniPlayerSettings(selectLyricsMiniPlayerSettings(settings));
+            setLyricsMiniPlayerSettingsReady(true);
           }
         })
         .catch(() => {
           if (!cancelled) {
             setLyricsMiniPlayerSettings(defaultLyricsMiniPlayerSettings);
+            setLyricsMiniPlayerSettingsReady(true);
           }
         });
     };
@@ -2299,6 +2510,46 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       window.removeEventListener('settings:changed', refreshLyricsMiniPlayerSettings);
     };
   }, []);
+
+  useEffect(() => {
+    const shortcut = lyricsMiniPlayerSettings.lyricsPlayerBarDrawerShortcutAccelerator?.toLowerCase() ?? null;
+    if (!isLyricsMiniPlayerShortcutModeActive || !shortcut) {
+      setIsLyricsMiniPlayerShortcutHidden(false);
+      return undefined;
+    }
+
+    const toggleMiniPlayer = (accelerator: string | null, event: Event): void => {
+      if (!accelerator || accelerator.toLowerCase() !== shortcut || document.body.dataset.echoShortcutRecording === 'true') {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setIsLyricsMiniPlayerShortcutHidden((hidden) => !hidden);
+    };
+
+    const handleShortcutKeyDown = (event: KeyboardEvent): void => {
+      if (event.repeat || isImeComposingKeyEvent(event) || isShortcutTextTarget(event)) {
+        return;
+      }
+
+      toggleMiniPlayer(acceleratorFromKeyboardEvent(event), event);
+    };
+
+    const handleShortcutMouseDown = (event: MouseEvent): void => {
+      toggleMiniPlayer(acceleratorFromMouseEvent(event), event);
+    };
+
+    window.addEventListener('keydown', handleShortcutKeyDown, true);
+    window.addEventListener('mousedown', handleShortcutMouseDown, true);
+    return () => {
+      window.removeEventListener('keydown', handleShortcutKeyDown, true);
+      window.removeEventListener('mousedown', handleShortcutMouseDown, true);
+    };
+  }, [
+    isLyricsMiniPlayerShortcutModeActive,
+    lyricsMiniPlayerSettings.lyricsPlayerBarDrawerShortcutAccelerator,
+  ]);
 
   useEffect(() => {
     if (!shouldAutoHideLyricsMiniPlayer) {
@@ -2435,15 +2686,21 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           'appWallpaperMediaType' in patch ||
           'appPortraitWallpaperMediaType' in patch ||
           'appWallpaperScalePercent' in patch ||
+          'appWallpaperFitMode' in patch ||
+          'appWallpaperPosition' in patch ||
+          'appPortraitWallpaperFitMode' in patch ||
+          'appPortraitWallpaperPosition' in patch ||
           'appWallpaperBlurPx' in patch ||
           'appWallpaperBrightnessPercent' in patch ||
           'appWallpaperUiOpacityPercent' in patch ||
+          'appWallpaperOpacityPercent' in patch ||
           'appWallpaperVisualProtectionEnabled' in patch ||
           'appWallpaperUnifiedOpacityEnabled' in patch ||
           'appWindowAcrylicEnabled' in patch ||
           'appWindowAcrylicKeepWhenUnfocusedEnabled' in patch ||
           'appWindowAcrylicTransparencyPercent' in patch ||
-          'appVideoWallpaperPauseMode' in patch)
+          'appVideoWallpaperPauseMode' in patch ||
+          'lowSpecModeEnabled' in patch)
       ) {
         setAppWallpaperSettings((current) => ({
           appCustomWallpaperPath: 'appCustomWallpaperPath' in patch ? (patch.appCustomWallpaperPath ?? null) : current.appCustomWallpaperPath,
@@ -2459,6 +2716,18 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           appWallpaperScalePercent: 'appWallpaperScalePercent' in patch
             ? (patch.appWallpaperScalePercent ?? defaultAppWallpaperSettings.appWallpaperScalePercent)
             : current.appWallpaperScalePercent,
+          appWallpaperFitMode: 'appWallpaperFitMode' in patch
+            ? (patch.appWallpaperFitMode ?? defaultAppWallpaperSettings.appWallpaperFitMode)
+            : current.appWallpaperFitMode,
+          appWallpaperPosition: 'appWallpaperPosition' in patch
+            ? (patch.appWallpaperPosition ?? null)
+            : current.appWallpaperPosition,
+          appPortraitWallpaperFitMode: 'appPortraitWallpaperFitMode' in patch
+            ? (patch.appPortraitWallpaperFitMode ?? defaultAppWallpaperSettings.appPortraitWallpaperFitMode)
+            : current.appPortraitWallpaperFitMode,
+          appPortraitWallpaperPosition: 'appPortraitWallpaperPosition' in patch
+            ? (patch.appPortraitWallpaperPosition ?? null)
+            : current.appPortraitWallpaperPosition,
           appWallpaperBlurPx: 'appWallpaperBlurPx' in patch
             ? (patch.appWallpaperBlurPx ?? defaultAppWallpaperSettings.appWallpaperBlurPx)
             : current.appWallpaperBlurPx,
@@ -2468,6 +2737,9 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           appWallpaperUiOpacityPercent: 'appWallpaperUiOpacityPercent' in patch
             ? (patch.appWallpaperUiOpacityPercent ?? defaultAppWallpaperSettings.appWallpaperUiOpacityPercent)
             : current.appWallpaperUiOpacityPercent,
+          appWallpaperOpacityPercent: 'appWallpaperOpacityPercent' in patch
+            ? (patch.appWallpaperOpacityPercent ?? defaultAppWallpaperSettings.appWallpaperOpacityPercent)
+            : current.appWallpaperOpacityPercent,
           appWallpaperVisualProtectionEnabled: 'appWallpaperVisualProtectionEnabled' in patch
             ? (patch.appWallpaperVisualProtectionEnabled !== false)
             : current.appWallpaperVisualProtectionEnabled,
@@ -2486,7 +2758,11 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           appVideoWallpaperPauseMode: 'appVideoWallpaperPauseMode' in patch
             ? (patch.appVideoWallpaperPauseMode ?? defaultAppWallpaperSettings.appVideoWallpaperPauseMode)
             : current.appVideoWallpaperPauseMode,
+          lowSpecModeEnabled: 'lowSpecModeEnabled' in patch
+            ? patch.lowSpecModeEnabled === true
+            : current.lowSpecModeEnabled,
         }));
+        setAppWallpaperSettingsReady(true);
         return;
       }
 
@@ -2495,11 +2771,13 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         .then((settings) => {
           if (!cancelled) {
             setAppWallpaperSettings(selectAppWallpaperSettings(settings));
+            setAppWallpaperSettingsReady(true);
           }
         })
         .catch(() => {
           if (!cancelled) {
             setAppWallpaperSettings(defaultAppWallpaperSettings);
+            setAppWallpaperSettingsReady(true);
           }
         });
     };
@@ -2664,11 +2942,43 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       return;
     }
 
-    void Promise.all([
-      loadPersistedRememberedAudioOutput(),
-      window.echo?.app?.getSettings?.().catch(() => null) ?? Promise.resolve(null),
-    ])
-      .then(([remembered, settings]) => {
+    let cancelled = false;
+    const initialRouteMutationSequence = getAudioOutputRouteMutationSequence();
+
+    if (isUltraLightRendererRestore(window.location.search)) {
+      // Recreating the control surface must not reopen a running native output
+      // with persisted preferences. Hydrate from Audio Core instead.
+      void audio.getStatus().then((status) => {
+        if (!cancelled) handleAudioDrawerStatusChange(status);
+      }).catch(() => undefined);
+      return () => { cancelled = true; };
+    }
+
+    void audio.getStatus().then((initialStatus) => {
+      if (cancelled) return null;
+      if (hasResidentAudioPlayback(initialStatus)) {
+        handleAudioDrawerStatusChange(initialStatus);
+        return null;
+      }
+      return Promise.all([
+        loadPersistedRememberedAudioOutput(),
+        window.echo?.app?.getSettings?.().catch(() => null) ?? Promise.resolve(null),
+      ]);
+    })
+      .then(async (configuration) => {
+        if (!configuration || cancelled) return;
+        const [remembered, settings] = configuration;
+        // Settings/route hydration can finish after a play click. Recheck the
+        // host immediately before applying cold-start preferences.
+        const latestStatus = await audio.getStatus();
+        if (cancelled || getAudioOutputRouteMutationSequence() !== initialRouteMutationSequence) {
+          return undefined;
+        }
+        if (hasResidentAudioPlayback(latestStatus)) {
+          handleAudioDrawerStatusChange(latestStatus);
+          return;
+        }
+
         const useMiniaudioOutput =
           settings?.audioUseMiniaudioOutput === true || settings?.audioMiniaudioOutputExperimentalEnabled === true;
         const useLibavDecode = settings?.audioUseLibavDecode === true;
@@ -2678,11 +2988,11 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         const sdmTargetRate = normalizeSdmTargetRate(settings?.audioSdmTargetRate);
         const sdmQualityProfile = normalizeSdmQualityProfile(settings?.audioSdmQualityProfile);
         const sdmComputeBackend = normalizeSdmComputeBackend(settings?.audioSdmComputeBackend);
-        const sdmOversamplingFilterProfile1x = normalizeEchoSrcFilterProfile(settings?.audioSdmOversamplingFilterProfile1x, 'poly-sinc-ext2-long');
-        const sdmOversamplingFilterProfileNx = normalizeEchoSrcFilterProfile(settings?.audioSdmOversamplingFilterProfileNx, 'poly-sinc-ext2-hires-lp');
+        const sdmOversamplingFilterProfile1x = normalizeEchoSrcFilterProfile(settings?.audioSdmOversamplingFilterProfile1x, 'sinc-long');
+        const sdmOversamplingFilterProfileNx = normalizeEchoSrcFilterProfile(settings?.audioSdmOversamplingFilterProfileNx, 'poly-sinc-hb');
         const exclusiveInstabilityFallbackEnabled = settings?.audioExclusiveInstabilityFallbackEnabled === true;
         const soxrFallbackEnabled = settings?.audioSoxrFallbackEnabled !== false;
-        const echoSrcMode = settings?.audioEchoSrcMode === 'family2x' || settings?.audioEchoSrcMode === 'family4x' || settings?.audioEchoSrcMode === 'family8x'
+        const echoSrcMode = (settings?.audioEchoSrcMode === 'compatibility48' || settings?.audioEchoSrcMode === 'family2x' || settings?.audioEchoSrcMode === 'family4x' || settings?.audioEchoSrcMode === 'family8x')
           ? settings.audioEchoSrcMode
           : 'off';
         const echoSrcQualityProfile =
@@ -2696,9 +3006,39 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         const echoSrcComputeBackend = settings?.audioEchoSrcComputeBackend === 'cuda' ? 'cuda' : 'cpu';
         const pcmDitherMode = normalizePcmDitherMode(settings?.audioPcmDitherMode);
         const releaseExclusiveOnPauseExperimentalEnabled = settings?.audioReleaseExclusiveOnPauseExperimentalEnabled === true;
+        const automaticOutputEnabled = settings?.audioAutomaticOutputEnabled === true;
+        if (automaticOutputEnabled) {
+          return audio
+            .setOutput({
+              automaticOutputEnabled: true,
+              useMiniaudioOutput,
+              useLibavDecode,
+              nativeDirectLocalPlaybackEnabled,
+              dsdOutputMode,
+              sdmMode,
+              sdmTargetRate,
+              sdmQualityProfile,
+              sdmComputeBackend,
+              sdmOversamplingFilterProfile1x,
+              sdmOversamplingFilterProfileNx,
+              exclusiveInstabilityFallbackEnabled,
+              soxrFallbackEnabled,
+              echoSrcMode,
+              echoSrcQualityProfile,
+              echoSrcAdvancedModeEnabled,
+              echoSrcFilterProfile,
+              echoSrcFilterProfile1x,
+              echoSrcFilterProfileNx,
+              echoSrcComputeBackend,
+              pcmDitherMode,
+              releaseExclusiveOnPauseExperimentalEnabled,
+            })
+            .then(handleAudioDrawerStatusChange);
+        }
         if (!remembered.enabled) {
           return audio
             .setOutput({
+              automaticOutputEnabled: false,
               useMiniaudioOutput,
               useLibavDecode,
               nativeDirectLocalPlaybackEnabled,
@@ -2726,6 +3066,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
         return audio
           .setOutput({
+            automaticOutputEnabled: false,
             outputMode: remembered.outputMode,
             sharedBackend: remembered.sharedBackend,
             latencyProfile: remembered.latencyProfile,
@@ -2756,8 +3097,18 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           .then(handleAudioDrawerStatusChange);
       })
       .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        if (isAuthorizationFailure(error)) {
+          return;
+        }
         console.error('Failed to restore remembered audio output', error);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [handleAudioDrawerStatusChange]);
 
   const notifyLibraryChanged = useCallback(async (options: { preserveScroll?: boolean } = {}): Promise<void> => {
@@ -3001,11 +3352,20 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
     setUpdateActionBusy(true);
     try {
+      if (availableUpdateStatus?.state === 'downloaded' && appApi.installUpdate) {
+        const result = await appApi.installUpdate();
+        if (result.outcome === 'blocked') {
+          showChromeNotice(`Update installation is blocked while these tasks are active: ${result.reasons.join(', ')}.`);
+        } else if (result.outcome === 'error') {
+          showChromeNotice(result.error);
+        }
+        return;
+      }
       setAvailableUpdateStatus(await appApi.downloadUpdate());
     } finally {
       setUpdateActionBusy(false);
     }
-  }, [handleOpenUpdateSettings]);
+  }, [availableUpdateStatus?.state, handleOpenUpdateSettings, showChromeNotice]);
 
   const showReportOpenedNotice = useCallback(
     (format: 'markdown' | 'text', reportPath: string | undefined): void => {
@@ -3117,7 +3477,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
   const updateNoticeMessage = availableUpdateStatus?.state === 'downloaded'
     ? (updateNoticeVersion ? t('notice.updateDownloadedVersion', { version: updateNoticeVersion }) : t('notice.updateDownloaded'))
     : (updateNoticeVersion ? t('notice.updateAvailableVersion', { version: updateNoticeVersion }) : t('notice.updateAvailable'));
-  const updateActionDisabled = updateActionBusy || availableUpdateStatus?.state === 'downloading' || availableUpdateStatus?.state === 'downloaded';
+  const updateActionDisabled = updateActionBusy || availableUpdateStatus?.state === 'downloading';
   const updateActionLabel = availableUpdateStatus?.state === 'downloading'
     ? t('settings.about.updates.progress.downloading')
     : t('notice.action.updateNow');
@@ -3131,7 +3491,7 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       } ${
         shouldShowAppWallpaperVisual && isAppWallpaperReady ? 'app-shell--wallpaper-ready' : ''
       } ${
-        appWallpaperSettings.appWindowAcrylicEnabled ? 'app-shell--acrylic' : ''
+        performancePolicy.appWindowAcrylicEnabled ? 'app-shell--acrylic' : ''
       } ${
         isLyricsVisualDrawerOpen ? 'app-shell--lyrics-visual-drawer-open' : ''
       } ${
@@ -3146,10 +3506,11 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       data-wallpaper-ui-transparent={shouldShowAppWallpaperVisual && isAppWallpaperUiTransparent ? 'true' : undefined}
       data-wallpaper-ui-zero={shouldShowAppWallpaperVisual && isAppWallpaperUiZero ? 'true' : undefined}
       data-wallpaper-orientation={shouldShowAppWallpaperVisual ? activeAppWallpaperOrientation : undefined}
-      data-window-acrylic={appWallpaperSettings.appWindowAcrylicEnabled ? 'true' : undefined}
-      data-window-acrylic-keep-unfocused={appWallpaperSettings.appWindowAcrylicEnabled && appWallpaperSettings.appWindowAcrylicKeepWhenUnfocusedEnabled ? 'true' : undefined}
+      data-window-acrylic={performancePolicy.appWindowAcrylicEnabled ? 'true' : undefined}
+      data-window-acrylic-keep-unfocused={performancePolicy.appWindowAcrylicEnabled && appWallpaperSettings.appWindowAcrylicKeepWhenUnfocusedEnabled ? 'true' : undefined}
+      data-active-route={activeRouteId}
+      data-low-spec-mode={performancePolicy.lowSpecModeEnabled ? 'true' : undefined}
       data-window-focused={isWindowFocused ? 'true' : 'false'}
-      data-feature-comments-hidden={featureCommentsHidden ? 'true' : undefined}
       data-window-fullscreen={isWindowFullscreen ? 'true' : 'false'}
       data-window-fullscreen-target={
         (windowFullscreenTransitionTarget ?? isWindowFullscreen) ? 'true' : 'false'
@@ -3157,12 +3518,17 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       data-window-fullscreen-transition={isWindowFullscreenTransitioning ? 'true' : undefined}
       style={appShellStyle}
     >
-      {appWallpaperUrl ? (
+      <a className="accessibility-skip-link" href={`#main-content-${activeRoute.id}`}>
+        {t('common.skipToContent')}
+      </a>
+      {shouldMountAppWallpaperMedia && appWallpaperUrl && appWallpaperKey ? (
         <div
           className="app-wallpaper-layer"
           aria-hidden="true"
           data-hidden={shouldShowAppWallpaperVisual ? undefined : 'true'}
           data-loaded={isAppWallpaperReady}
+          data-error={hasAppWallpaperLoadError ? 'true' : undefined}
+          style={appWallpaperLayerStyle}
         >
           {isAppWallpaperVideo ? (
             <video
@@ -3174,22 +3540,43 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
               playsInline
               preload="metadata"
               style={appWallpaperStyle}
-              onCanPlay={() => setLoadedAppWallpaperKey(appWallpaperKey)}
-              onLoadedData={() => setLoadedAppWallpaperKey(appWallpaperKey)}
-              onEnded={(event) => {
-                event.currentTarget.currentTime = 0;
-                void event.currentTarget.play().catch(() => undefined);
+              onCanPlay={() => {
+                setFailedAppWallpaperKey(null);
+                setLoadedAppWallpaperKey(appWallpaperKey);
+              }}
+              onLoadedData={(event) => {
+                const video = event.currentTarget;
+                if (video.videoWidth > 0 && video.videoHeight > 0) {
+                  setAppWallpaperNatural({ key: appWallpaperKey, w: video.videoWidth, h: video.videoHeight });
+                }
+                setFailedAppWallpaperKey(null);
+                setLoadedAppWallpaperKey(appWallpaperKey);
               }}
               onError={() => {
-                setLoadedAppWallpaperKey((current) => (current === appWallpaperKey ? current : null));
+                setLoadedAppWallpaperKey(null);
+                setFailedAppWallpaperKey(appWallpaperKey);
+                showChromeNotice(t('settings.appearance.wallpaper.loadError'));
               }}
             />
           ) : (
             <img
+              ref={appWallpaperImageRef}
               src={appWallpaperUrl}
               alt=""
               style={appWallpaperStyle}
-              onLoad={() => setLoadedAppWallpaperKey(appWallpaperKey)}
+              onLoad={(event) => {
+                const image = event.currentTarget;
+                if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+                  setAppWallpaperNatural({ key: appWallpaperKey, w: image.naturalWidth, h: image.naturalHeight });
+                }
+                setFailedAppWallpaperKey(null);
+                setLoadedAppWallpaperKey(appWallpaperKey);
+              }}
+              onError={() => {
+                setLoadedAppWallpaperKey(null);
+                setFailedAppWallpaperKey(appWallpaperKey);
+                showChromeNotice(t('settings.appearance.wallpaper.loadError'));
+              }}
             />
           )}
         </div>
@@ -3201,10 +3588,11 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         isLyricsSettingsOpen={isLyricsDrawerOpen}
         isLyricsVisualSettingsOpen={isLyricsVisualDrawerOpen}
         isMvSettingsOpen={isMvDrawerOpen}
-        isProUnlocked={connectDonatorUnlocked || echoProPluginUnlocked}
         updateStatus={availableUpdateStatus}
+        updateActionDisabled={updateActionDisabled}
         onRouteChange={navigateRoute}
-        onOpenUpdateSettings={handleOpenUpdateSettings}
+        onPreloadSettings={preloadSettingsRoute}
+        onUpdateAction={() => void handleStartUpdate()}
         onOpenAudioSettings={handleOpenAudioSettingsDrawer}
         onOpenLyricsSettings={handleOpenLyricsSettingsDrawer}
         onOpenLyricsVisualSettings={handleOpenLyricsVisualSettingsDrawer}
@@ -3222,12 +3610,15 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
           routes={visibleRoutes}
           activeRouteId={activeRouteId}
           iconOnly={sidebarLayoutSettings.sidebarIconOnlyEnabled && !sidebarLayoutSettings.sidebarAutoHideEnabled}
+          hiddenRouteIds={normalizeSidebarHiddenRouteIds(sidebarLayoutSettings.sidebarHiddenRouteIds)}
           onRouteChange={navigateRoute}
           onOpenAudioSettings={handleOpenAudioSettingsDrawer}
           onOpenLyricsSettings={handleOpenLyricsSettingsDrawer}
           onImportFolder={() => void handleImportFolder()}
           onImportFile={() => void handleImportFile()}
+          onToggleIconOnly={handleSidebarIconOnlyToggle}
           onHideRoute={handleSidebarRouteHide}
+          onShowRoute={handleSidebarRouteShow}
           onReorderRoutes={handleSidebarRouteReorder}
         />
       )}
@@ -3237,7 +3628,8 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         const routeIsStandalone = route.chrome === 'standalone';
         const routeElement =
           route.id === 'lyrics' && isValidElement(route.element)
-            ? cloneElement(route.element as ReactElement<{ usePlayerDrawerHeader?: boolean }>, {
+            ? cloneElement(route.element as ReactElement<{ isActive?: boolean; usePlayerDrawerHeader?: boolean }>, {
+                isActive,
                 usePlayerDrawerHeader: shouldUseLyricsPlayerDrawer,
               })
             : route.element;
@@ -3261,35 +3653,26 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
 
       {shouldRenderDragDropImportOverlay ? <DragDropImportOverlay onNotice={showChromeNotice} /> : null}
 
-      {shouldRenderUserNoticeGate ? (
-        <UserNoticeGate
-          onAccepted={(settings) => {
-            setUserNoticeSettingsLoaded(true);
-            setUserNoticeAccepted(true);
-            setUserNoticeReviewOpen(false);
-            if (settings) {
-              setFirstRunSettings(settings);
-              setAppWallpaperSettings(selectAppWallpaperSettings(settings));
-              setLyricsMiniPlayerSettings(selectLyricsMiniPlayerSettings(settings));
-            }
-          }}
-        />
+      {shouldRenderFirstRunWizard ? (
+        <Suspense fallback={null}>
+          <FirstRunWizard
+            initialSettings={firstRunSettings}
+            presentationState={isFirstRunWizardClosing ? 'closing' : 'open'}
+            onClose={closeFirstRunWizard}
+            onCompleted={(settings) => {
+              if (settings) {
+                setFirstRunSettings(settings);
+                setAppWallpaperSettings(selectAppWallpaperSettings(settings));
+                setLyricsMiniPlayerSettings(selectLyricsMiniPlayerSettings(settings));
+              }
+            }}
+          />
+        </Suspense>
       ) : null}
 
-      {shouldRenderFirstRunWizard ? (
-        <FirstRunWizard
-          initialSettings={firstRunSettings}
-          presentationState={isFirstRunWizardClosing ? 'closing' : 'open'}
-          onClose={closeFirstRunWizard}
-          onCompleted={(settings) => {
-            if (settings) {
-              setFirstRunSettings(settings);
-              setAppWallpaperSettings(selectAppWallpaperSettings(settings));
-              setLyricsMiniPlayerSettings(selectLyricsMiniPlayerSettings(settings));
-            }
-          }}
-        />
-      ) : null}
+      <Suspense fallback={null}>
+        <SteamEditionWelcome />
+      </Suspense>
 
       <input
         ref={folderInputRef}
@@ -3311,7 +3694,9 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
       />
 
       {audioIssueDiagnosticsWindowEnabled ? (
-        <AudioIssueDiagnosticsWindow onClose={handleCloseAudioIssueDiagnosticsWindow} />
+        <Suspense fallback={null}>
+          <AudioIssueDiagnosticsWindow onClose={handleCloseAudioIssueDiagnosticsWindow} />
+        </Suspense>
       ) : null}
 
       <div className="chrome-notice-layer">
@@ -3442,16 +3827,27 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         </ChromeNoticePresence>
 
         <ChromeNoticePresence
-          className="chrome-notice--account"
-          role="alert"
-          show={!notificationsDisabled && Boolean(accountNotice)}
+          ariaLive="polite"
+          className="chrome-notice--audio-error"
+          role="status"
+          show={!notificationsDisabled && audioComponentNotice}
         >
-          {accountNotice ? (
-            <>
-              <strong>{t('notice.accountExpired.title')}</strong>
-              <span>{accountNotice}</span>
-            </>
-          ) : null}
+          <>
+            <strong>{t('notice.audioComponent.title')}</strong>
+            <span>{t('notice.audioComponent.description')}</span>
+            <small>{t('notice.audioComponent.size')}</small>
+            <div className="chrome-notice-actions">
+              <button type="button" disabled={audioComponentActionBusy} onClick={() => void handleOpenAudioComponentDownloadPage()}>
+                {t('notice.audioComponent.action.download')}
+              </button>
+              <button type="button" disabled={audioComponentActionBusy} onClick={() => void handleImportAudioComponent()}>
+                {t('notice.audioComponent.action.import')}
+              </button>
+              <button type="button" disabled={audioComponentActionBusy} onClick={() => setAudioComponentNotice(false)}>
+                {t('notice.audioComponent.action.later')}
+              </button>
+            </div>
+          </>
         </ChromeNoticePresence>
 
         <ChromeNoticePresence
@@ -3480,37 +3876,49 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
         </ChromeNoticePresence>
       </div>
 
-      <AudioSettingsDrawer
-        isOpen={isAudioDrawerOpen}
-        status={audioDrawerStatus}
-        hqPlayerTakeoverEnabled={playbackQueue.hqPlayerTakeoverEnabled}
-        hqPlayerTrack={playbackQueue.currentTrack ?? playbackQueue.lastPlayedTrack}
-        onClose={() => setIsAudioDrawerOpen(false)}
-        onActivateHqPlayerTakeover={async () => {
-          const status = await playbackQueue.activateHqPlayerTakeover();
-          if (status) {
-            setPlaybackStatusSnapshot({ playbackStatus: status, error: null });
-          }
-        }}
-        onHqPlayerTakeoverEnabledChange={playbackQueue.setHqPlayerTakeoverEnabled}
-        onStatusChange={handleAudioDrawerStatusChange}
-      />
-      <LyricsSettingsDrawer
-        currentTrackTools={lyricsDrawerCurrentTrackTools}
-        isOpen={isLyricsDrawerOpen}
-        onClose={() => setIsLyricsDrawerOpen(false)}
-      />
-      <LyricsVisualSettingsDrawer
-        isOpen={isLyricsVisualDrawerOpen}
-        onClose={() => setIsLyricsVisualDrawerOpen(false)}
-      />
-      <MvSettingsDrawer isOpen={isMvDrawerOpen} onClose={() => setIsMvDrawerOpen(false)} />
+      <Suspense fallback={null}>
+        {shouldMountAudioDrawer ? (
+          <AudioSettingsDrawer
+            isOpen={isAudioDrawerOpen}
+            status={audioDrawerStatus}
+            hqPlayerTakeoverEnabled={playbackQueue.hqPlayerTakeoverEnabled}
+            hqPlayerTrack={playbackQueue.currentTrack ?? playbackQueue.lastPlayedTrack}
+            onClose={() => setIsAudioDrawerOpen(false)}
+            onActivateHqPlayerTakeover={async () => {
+              const status = await playbackQueue.activateHqPlayerTakeover();
+              if (status) {
+                setPlaybackStatusSnapshot({ playbackStatus: status, error: null });
+              }
+            }}
+            onHqPlayerTakeoverEnabledChange={playbackQueue.setHqPlayerTakeoverEnabled}
+            onStatusChange={handleAudioDrawerStatusChange}
+          />
+        ) : null}
+        {shouldMountLyricsDrawer ? (
+          <LyricsSettingsDrawer
+            currentTrackTools={lyricsDrawerCurrentTrackTools}
+            isOpen={isLyricsDrawerOpen}
+            onClose={() => setIsLyricsDrawerOpen(false)}
+          />
+        ) : null}
+        {shouldMountLyricsVisualDrawer ? (
+          <LyricsVisualSettingsDrawer
+            isOpen={isLyricsVisualDrawerOpen}
+            onClose={() => setIsLyricsVisualDrawerOpen(false)}
+          />
+        ) : null}
+        {shouldMountMvDrawer ? <MvSettingsDrawer isOpen={isMvDrawerOpen} onClose={() => setIsMvDrawerOpen(false)} /> : null}
+      </Suspense>
       <PluginTrackActionDrawerHost />
-      <PlaybackQueueDrawer
-        isOpen={isLyricsRoute && isLyricsQueueDrawerOpen}
-        onClose={() => setIsLyricsQueueDrawerOpen(false)}
-        onOpenFullQueue={handleOpenFullQueueFromLyricsDrawer}
-      />
+      <Suspense fallback={null}>
+        {shouldMountLyricsQueueDrawer ? (
+          <PlaybackQueueDrawer
+            isOpen={isLyricsRoute && isLyricsQueueDrawerOpen}
+            onClose={() => setIsLyricsQueueDrawerOpen(false)}
+            onOpenFullQueue={handleOpenFullQueueFromLyricsDrawer}
+          />
+        ) : null}
+      </Suspense>
 
       {shouldRenderPlayerBar ? (
         <div
@@ -3519,17 +3927,28 @@ export const AppLayout = ({ routes }: AppLayoutProps): JSX.Element => {
             'player-bar-host',
             shouldUseLyricsPlayerDrawer ? 'lyrics-player-drawer-host lyrics-mini-player-host' : '',
             shouldAutoHideLyricsMiniPlayer ? 'lyrics-player-drawer-host--auto-hide' : '',
+            isLyricsMiniPlayerShortcutModeActive ? 'lyrics-player-drawer-host--shortcut-toggle' : '',
             isLyricsMiniPlayerVisuallyHidden ? 'lyrics-player-drawer-host--auto-hidden' : '',
           ].filter(Boolean).join(' ')}
           data-auto-hide={shouldAutoHideLyricsMiniPlayer ? 'true' : undefined}
           data-auto-hide-state={shouldAutoHideLyricsMiniPlayer ? (isLyricsMiniPlayerVisuallyHidden ? 'hidden' : 'visible') : undefined}
+          data-shortcut-toggle={isLyricsMiniPlayerShortcutModeActive ? 'true' : undefined}
+          data-shortcut-toggle-state={
+            isLyricsMiniPlayerShortcutModeActive ? (isLyricsMiniPlayerVisuallyHidden ? 'hidden' : 'visible') : undefined
+          }
+          data-mini-player-settings-ready={
+            shouldUseLyricsPlayerDrawer ? (lyricsMiniPlayerSettingsReady ? 'true' : 'false') : undefined
+          }
           data-mini-player-color-mode={shouldUseLyricsPlayerDrawer ? lyricsMiniPlayerSettings.lyricsPlayerBarDrawerColorMode : undefined}
           style={shouldUseLyricsPlayerDrawer ? lyricsMiniPlayerStyle : undefined}
         >
           <PlayerBar
             desktopLyricsVisible={desktopLyricsVisible}
             hasDesktopLyricsBridge={hasDesktopLyricsBridge}
-            lyricsCompactOnIdle={lyricsMiniPlayerSettings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true}
+            lyricsCompactOnIdle={
+              lyricsMiniPlayerSettings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true &&
+              !isLyricsMiniPlayerShortcutModeActive
+            }
             lyricsMiniPlayer={shouldUseLyricsPlayerDrawer}
             onOpenAudioSettings={handleOpenAudioSettingsDrawer}
             onOpenQueue={isLyricsRoute ? handleOpenLyricsQueueDrawer : handleOpenShellQueue}

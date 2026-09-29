@@ -16,7 +16,11 @@ const sharedPlaybackState = vi.hoisted(() => ({
 }));
 
 vi.mock('../stores/playbackStatusStore', () => ({
-  useSharedPlaybackStatus: () => sharedPlaybackState.value,
+  beginPlaybackSwitchSnapshot: vi.fn(),
+  setPlaybackStatusSnapshot: vi.fn(),
+  useSharedPlaybackStatusOnly: () => sharedPlaybackState.value.playbackStatus ?? null,
+  useSharedPlaybackActivityState: () =>
+    sharedPlaybackState.value.audioStatus?.state ?? sharedPlaybackState.value.playbackStatus?.state ?? 'idle',
 }));
 
 vi.mock('../components/artist/ArtistDetailView', () => ({
@@ -169,7 +173,7 @@ describe('ArtistsPage', () => {
     await waitFor(() => expect(getArtists).toHaveBeenCalledTimes(1));
     expect(getArtists).toHaveBeenCalledWith({ page: 1, pageSize: 96, search: '', sort: 'default', sourceProvider: 'local' });
     expect(screen.getByText('安田レイ')).toBeTruthy();
-    expect(screen.getByText('4 tracks / 1 albums')).toBeTruthy();
+    expect(await screen.findByText('4 tracks / 1 albums')).toBeTruthy();
     expect(screen.getByText('安田')).toBeTruthy();
   });
 

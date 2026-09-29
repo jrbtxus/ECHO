@@ -10,7 +10,9 @@ import {
   readSongsStartupLoadDiagnostics,
   writeSongsFirstPageSnapshot,
 } from '../stores/songsFirstPageSnapshot';
+import { loadTranslations } from '../i18n/locales';
 import { showAudioErrorNoticeEvent } from '../utils/audioErrorNotice';
+
 
 const sharedPlaybackState = vi.hoisted(() => ({
   value: {
@@ -22,12 +24,15 @@ const sharedPlaybackState = vi.hoisted(() => ({
 vi.mock('../stores/playbackStatusStore', () => ({
   beginPlaybackSwitchSnapshot: vi.fn(),
   setPlaybackStatusSnapshot: vi.fn(),
-  useSharedPlaybackStatus: () => sharedPlaybackState.value,
+  useSharedPlaybackStatusOnly: () => sharedPlaybackState.value.playbackStatus ?? null,
+  useSharedPlaybackActivityState: () =>
+    sharedPlaybackState.value.audioStatus?.state ?? sharedPlaybackState.value.playbackStatus?.state ?? 'idle',
 }));
 
 vi.mock('../components/library/TrackList', () => ({
   TrackList: ({
     tracks,
+    selectedTrackIds,
     currentTrackId,
     currentTrackIndex,
     canLoadMore,
@@ -38,6 +43,8 @@ vi.mock('../components/library/TrackList', () => ({
     loadedCount,
     loadedStartIndex,
     onEndReached,
+    onViewportNeeded,
+    onToggleSelected,
     onAddToPlaylist,
     onOpenTrackMenu,
     onPlay,
@@ -48,6 +55,7 @@ vi.mock('../components/library/TrackList', () => ({
     totalCount,
   }: {
     tracks: LibraryTrack[];
+    selectedTrackIds?: Record<string, boolean>;
     currentTrackId: string | null;
     currentTrackIndex?: number | null;
     canLoadMore?: boolean;
@@ -58,6 +66,8 @@ vi.mock('../components/library/TrackList', () => ({
     loadedCount?: number;
     loadedStartIndex?: number;
     onEndReached?: () => void;
+    onViewportNeeded?: (range: { firstIndex: number; lastIndex: number }) => void;
+    onToggleSelected?: (track: LibraryTrack) => void;
     onAddToPlaylist?: (track: LibraryTrack) => void;
     onOpenTrackMenu?: (track: LibraryTrack, position: { x: number; y: number }) => void;
     onPlay?: (track: LibraryTrack) => void;
@@ -70,6 +80,7 @@ vi.mock('../components/library/TrackList', () => ({
     <div
       className="track-list"
       data-testid="track-list"
+      data-selected-count={Object.values(selectedTrackIds ?? {}).filter(Boolean).length}
       data-total-count={totalCount ?? tracks.length}
       data-loaded-count={loadedCount ?? tracks.length}
       data-loaded-start-index={loadedStartIndex ?? 0}
@@ -80,6 +91,8 @@ vi.mock('../components/library/TrackList', () => ({
       <button type="button" onClick={() => onVisibleTrackIdsChange?.(tracks.slice(0, 2).map((track) => track.id))}>
         mock-visible
       </button>
+      <button onClick={() => onViewportNeeded?.({ firstIndex: 10000, lastIndex: 10009 })}>mock-jump-far</button>
+      <button onClick={() => onViewportNeeded?.({ firstIndex: 5000, lastIndex: 5009 })}>mock-jump-middle</button>
       <span data-testid="current-track-id">{currentTrackId ?? 'none'}</span>
       <button type="button" disabled={!canLoadMore} onClick={onEndReached}>
         mock-load-more
@@ -111,6 +124,7 @@ vi.mock('../components/library/TrackList', () => ({
           >
             {likedTrackIds?.[track.id] ? `Unlike ${track.title}` : `Like ${track.title}`}
           </button>
+          <button onClick={() => onToggleSelected?.(track)}>Select {track.title}</button>
           <button type="button" onClick={() => onAddToPlaylist?.(track)}>
             添加到歌单 {track.title}
           </button>
@@ -142,6 +156,10 @@ const renderSongsPage = async (): Promise<void> => {
       </PlaybackQueueProvider>
     </I18nProvider>,
   );
+};
+
+const openSongFilters = (): void => {
+  fireEvent.click(screen.getByRole('button', { name: /筛选|Filter/ }));
 };
 
 const makeTrack = (overrides: Partial<LibraryTrack> = {}): LibraryTrack => ({
@@ -486,6 +504,18 @@ describe('SongsPage', () => {
     );
   });
 
+  it('migrates the legacy frequent sort to play count descending', async () => {
+    window.localStorage.setItem('echo-next.songs.sort', 'frequent');
+    installEcho([makeTrack()]);
+
+    await renderSongsPage();
+
+    await waitFor(() =>
+      expect(window.echo.library.getTracks).toHaveBeenCalledWith(expect.objectContaining({ sort: 'playCountDesc' })),
+    );
+    expect(window.localStorage.getItem('echo-next.songs.sort')).toBe('playCountDesc');
+  });
+
   it('remembers the selected song sort mode', async () => {
     installEcho([makeTrack()]);
 
@@ -499,12 +529,32 @@ describe('SongsPage', () => {
     );
   });
 
-  it('filters the song list to duplicate tracks from the sort menu', async () => {
+  it('groups discovery sorts and sends the selected sort to the paged query', async () => {
+    installEcho([makeTrack()]);
+
+    await renderSongsPage();
+    fireEvent.click(screen.getByRole('button', { name: /默认排序|Default sort/ }));
+
+    expect(screen.getByText(/^(浏览|Browse)$/)).toBeTruthy();
+    expect(screen.getByText(/^(聆听|Listening)$/)).toBeTruthy();
+    expect(screen.getByText(/^(音频|Audio)$/)).toBeTruthy();
+    expect(screen.getByText(/^(曲库|Library)$/)).toBeTruthy();
+    expect(screen.getByRole('option', { name: /最近播放|Recently played/ })).toBeTruthy();
+    expect(screen.getByRole('option', { name: /BPM.*慢到快|BPM, slow to fast/ })).toBeTruthy();
+    expect(screen.getByRole('option', { name: /音频规格.*高到低|Audio quality, high to low/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('option', { name: /发行年份.*最新|Release year, newest/ }));
+    await waitFor(() =>
+      expect(window.echo.library.getTracks).toHaveBeenLastCalledWith(expect.objectContaining({ sort: 'yearDesc' })),
+    );
+  });
+
+  it('filters the song list to duplicate tracks from the filter menu', async () => {
     installEcho([makeTrack(), makeTrack({ id: 'track-2', title: 'Song Two' })]);
 
     await renderSongsPage();
     await screen.findByText('Song One');
-    fireEvent.click(screen.getByRole('button', { name: /默认排序|Default sort/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /只看重复歌曲|Duplicates only/ }));
 
     await waitFor(() =>
@@ -524,12 +574,8 @@ describe('SongsPage', () => {
 
     await renderSongsPage();
     await screen.findByText('Song One');
-    fireEvent.click(screen.getByRole('button', { name: /榛樿鎺掑簭|Default sort/ }));
-    const optionLabels = screen.getAllByRole('option').map((option) => option.textContent ?? '');
-    const defaultSortIndex = optionLabels.findIndex((label) => label.includes('Default sort') || label.includes('榛樿鎺掑簭'));
-    const sampleRateIndex = optionLabels.findIndex((label) => label.includes('192 kHz'));
-    expect(defaultSortIndex).toBeGreaterThanOrEqual(0);
-    expect(defaultSortIndex).toBeLessThan(sampleRateIndex);
+    openSongFilters();
+    expect(screen.queryByRole('option', { name: /默认排序|Default sort/ })).toBeNull();
     fireEvent.click(screen.getByRole('option', { name: /192 kHz/ }));
 
     await waitFor(() =>
@@ -549,7 +595,7 @@ describe('SongsPage', () => {
 
     await renderSongsPage();
     await screen.findByText('Song One');
-    fireEvent.click(screen.getByRole('button', { name: /姒涙顓婚幒鎺戠碍|Default sort/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
 
     await waitFor(() =>
@@ -600,7 +646,7 @@ describe('SongsPage', () => {
     await renderSongsPage();
     await screen.findByText('Bismuth');
 
-    fireEvent.click(screen.getByRole('button', { name: /Default sort|榛樿鎺掑簭|濮掓稒顭堥濠氬箳閹烘垹纰?/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
     fireEvent.click(await screen.findByRole('switch', { name: /高音质音源|Hi-Fi Source/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Bismuth' }));
@@ -662,7 +708,7 @@ describe('SongsPage', () => {
     await renderSongsPage();
     await screen.findByText('Matusa Bomber');
 
-    fireEvent.click(document.querySelector('.sort-button') as HTMLButtonElement);
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
     fireEvent.click(await screen.findByRole('switch', { name: /Hi-Fi Source/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Labyrinth' }));
@@ -698,7 +744,7 @@ describe('SongsPage', () => {
     await renderSongsPage();
     await screen.findByText('Cord Cutter');
 
-    fireEvent.click(screen.getByRole('button', { name: /Default sort|姒涙顓婚幒鎺戠碍|婵帗绋掗…鍫ヮ敇婵犳艾绠抽柟鐑樺灩绾?/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
     fireEvent.click(await screen.findByRole('switch', { name: /Hi-Fi Source/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Cord Cutter' }));
@@ -725,7 +771,7 @@ describe('SongsPage', () => {
     await renderSongsPage();
     await screen.findByText('Bismuth');
 
-    fireEvent.click(screen.getByRole('button', { name: /Default sort|姒涙顓婚幒鎺戠碍|婵帗绋掗…鍫ヮ敇婵犳艾绠抽柟鐑樺灩绾?/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Bismuth' }));
 
@@ -999,6 +1045,43 @@ describe('SongsPage', () => {
     expect(window.prompt).not.toHaveBeenCalled();
   });
 
+  it('rescans one local song embedded tags from the song list context menu', async () => {
+    const track = makeTrack();
+    const rescannedTrack = makeTrack({
+      title: '06 \u5b64\u72ec\u306a\u5de1\u793c',
+      genre: '\u30a2\u30cb\u30e1',
+    });
+    installEcho([track]);
+    vi.mocked(window.echo.app.getSettings).mockResolvedValue({
+      duplicateTracksEnabled: false,
+      duplicateTracksMode: 'strict',
+      trackContextMenuExtraActionsEnabled: true,
+    } as AppSettings);
+    window.echo.library.loadEmbeddedTrackTags = vi.fn().mockResolvedValue({
+      tags: {
+        title: rescannedTrack.title,
+        artist: rescannedTrack.artist,
+        album: rescannedTrack.album,
+        albumArtist: rescannedTrack.albumArtist,
+        trackNo: rescannedTrack.trackNo,
+        discNo: rescannedTrack.discNo,
+        year: rescannedTrack.year,
+        genre: rescannedTrack.genre,
+      },
+      coverId: rescannedTrack.coverId,
+      coverThumb: rescannedTrack.coverThumb,
+      track: rescannedTrack,
+    });
+
+    await renderSongsPage();
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Song One' }), { clientX: 240, clientY: 180 });
+    await screen.findByRole('menuitem', { name: 'Add to playlist...' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /重扫内嵌标签|Rescan embedded tags/u }));
+
+    await waitFor(() => expect(window.echo.library.loadEmbeddedTrackTags).toHaveBeenCalledWith('track-1'));
+  });
+
   it('opens osu timing from the song context menu and copies the timing line', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(window.navigator, 'clipboard', {
@@ -1031,12 +1114,67 @@ describe('SongsPage', () => {
 
     await renderSongsPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: /Default sort/ }));
+    openSongFilters();
     fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
     fireEvent.contextMenu(await screen.findByRole('button', { name: 'Cord Cutter' }), { clientX: 240, clientY: 180 });
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Open beatmap page' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Beatmap details' }));
 
     await waitFor(() => expect(window.echo.app.openExternalUrl).toHaveBeenCalledWith('https://osu.ppy.sh/beatmapsets/1859304'));
+  });
+
+  it('opens the exact osu beatmap from downloader metadata', async () => {
+    installEcho([
+      makeTrack({
+        title: 'Downloaded Map',
+        album: '',
+        fieldSources: {
+          osu: 'osu',
+          'osuBeatmapId:5477400': 'osu',
+          'osuBeatmapsetId:2492872': 'osu',
+        },
+      }),
+    ]);
+
+    await renderSongsPage();
+    await waitFor(() => expect(window.echo.library.getTracks).toHaveBeenCalled());
+    openSongFilters();
+    fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Downloaded Map' }), { clientX: 240, clientY: 180 });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Beatmap details' }));
+
+    await waitFor(() => expect(window.echo.app.openExternalUrl).toHaveBeenCalledWith('https://osu.ppy.sh/beatmaps/5477400'));
+  });
+
+  it('reads the embedded map id for osu downloads imported before id markers were added', async () => {
+    const track = makeTrack({ title: 'Earlier Download', album: '', fieldSources: { osu: 'osu' } });
+    installEcho([track]);
+    window.echo.library.loadEmbeddedTrackTags = vi.fn().mockResolvedValue({
+      tags: {
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        albumArtist: track.albumArtist,
+        trackNo: track.trackNo,
+        discNo: track.discNo,
+        year: track.year,
+        genre: track.genre,
+        comment: 'beatmap id: 5318008',
+      },
+      coverId: track.coverId,
+      coverThumb: track.coverThumb,
+      track,
+    });
+
+    await renderSongsPage();
+    await waitFor(() => expect(window.echo.library.getTracks).toHaveBeenCalled());
+    openSongFilters();
+    fireEvent.click(screen.getByRole('option', { name: /osu!/ }));
+
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'Earlier Download' }), { clientX: 240, clientY: 180 });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Beatmap details' }));
+
+    await waitFor(() => expect(window.echo.app.openExternalUrl).toHaveBeenCalledWith('https://osu.ppy.sh/beatmaps/5318008'));
   });
 
   it('prunes invalid library entries from the toolbar without starting a folder scan', async () => {
@@ -1306,6 +1444,93 @@ describe('SongsPage', () => {
     await new Promise((resolve) => setTimeout(resolve, 260));
 
     expect(window.echo.remoteSources.hydrateVisibleTracks).not.toHaveBeenCalled();
+  });
+
+  it('viewport scroll seeks directly to page 101 and preserves the scroll container', async () => {
+    window.localStorage.setItem('echo-next.locale', 'zh-CN');
+    await loadTranslations('zh-CN');
+    const first = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `first-${i}`, title: `First ${i}` }));
+    const far = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `far-${i}`, title: `Far ${i}` }));
+    installEcho(first);
+    vi.mocked(window.echo.app.getSettings).mockResolvedValue({ locale: 'zh-CN', duplicateTracksEnabled: false, duplicateTracksMode: 'strict' } as AppSettings);
+    vi.mocked(window.echo.library.getTracks).mockImplementation(async (query) =>
+      makePagedResult(query?.page === 101 ? far : first, { page: query?.page ?? 1, total: 18709, hasMore: true }));
+    await renderSongsPage();
+    await screen.findByText('First 0');
+    const list = screen.getByTestId('track-list');
+    list.scrollTop = 760000;
+    fireEvent.click(screen.getByRole('button', { name: 'Select First 0' }));
+    expect(list.getAttribute('data-selected-count')).toBe('1');
+    fireEvent.click(screen.getByRole('button', { name: 'mock-jump-far' }));
+    await screen.findByText('Far 0');
+    expect(vi.mocked(window.echo.library.getTracks).mock.calls.filter(([query]) => query?.page === 101)).toHaveLength(1);
+    expect(vi.mocked(window.echo.library.getTracks).mock.calls.every(([query]) => query?.page === 1 || query?.page === 101)).toBe(true);
+    expect(screen.getByTestId('track-list')).toBe(list);
+    expect(list.scrollTop).toBe(760000);
+    expect(list.getAttribute('data-loaded-start-index')).toBe('10000');
+    expect(list.getAttribute('data-selected-count')).toBe('1');
+    fireEvent.click(screen.getByRole('button', { name: 'Select Far 0' }));
+    expect(list.getAttribute('data-selected-count')).toBe('2');
+  });
+
+  it('viewport requests during a pending page read load only the latest destination next', async () => {
+    window.localStorage.setItem('echo-next.locale', 'zh-CN');
+    await loadTranslations('zh-CN');
+    const first = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `first-${i}`, title: `First ${i}` }));
+    const middle = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `middle-${i}`, title: `Middle ${i}` }));
+    const far = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `far-${i}`, title: `Far ${i}` }));
+    installEcho(first);
+    vi.mocked(window.echo.app.getSettings).mockResolvedValue({ locale: 'zh-CN', duplicateTracksEnabled: false, duplicateTracksMode: 'strict' } as AppSettings);
+    let finish!: (value: ReturnType<typeof makePagedResult>) => void;
+    vi.mocked(window.echo.library.getTracks).mockImplementation((query) => {
+      if (query?.page === 51) return new Promise((resolve) => { finish = resolve; });
+      return Promise.resolve(makePagedResult(query?.page === 101 ? far : first, { page: query?.page ?? 1, total: 18709, hasMore: true }));
+    });
+    await renderSongsPage();
+    await screen.findByText('First 0');
+    fireEvent.click(screen.getByRole('button', { name: 'mock-jump-middle' }));
+    await waitFor(() => expect(vi.mocked(window.echo.library.getTracks).mock.calls.some(([query]) => query?.page === 51)).toBe(true));
+    fireEvent.click(screen.getByRole('button', { name: 'mock-jump-far' }));
+    expect(vi.mocked(window.echo.library.getTracks).mock.calls.some(([query]) => query?.page === 101)).toBe(false);
+    finish(makePagedResult(middle, { page: 51, total: 18709, hasMore: true }));
+    await screen.findByText('Far 0');
+    expect(vi.mocked(window.echo.library.getTracks).mock.calls.filter(([query]) => (query?.page ?? 1) > 1).map(([query]) => query?.page)).toEqual([51, 101]);
+  });
+
+  it('viewport refresh never restores an old scroll position over a newer wheel destination', async () => {
+    window.localStorage.setItem('echo-next.locale', 'zh-CN');
+    await loadTranslations('zh-CN');
+    const first = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `first-${i}`, title: `First ${i}` }));
+    const far = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `far-${i}`, title: `Far ${i}` }));
+    const middle = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `middle-${i}`, title: `Middle ${i}` }));
+    installEcho(first);
+    vi.mocked(window.echo.app.getSettings).mockResolvedValue({ locale: 'zh-CN', duplicateTracksEnabled: false } as AppSettings);
+    let refreshPending = false;
+    let finish!: (value: ReturnType<typeof makePagedResult>) => void;
+    vi.mocked(window.echo.library.getTracks).mockImplementation((query) => {
+      if (query?.page === 101 && refreshPending) {
+        refreshPending = false;
+        return new Promise((resolve) => { finish = resolve; });
+      }
+      return Promise.resolve(makePagedResult(query?.page === 101 ? far : query?.page === 51 ? middle : first,
+        { page: query?.page ?? 1, total: 18709, hasMore: true }));
+    });
+    await renderSongsPage();
+    await screen.findByText('First 0');
+    fireEvent.click(screen.getByRole('button', { name: 'mock-jump-far' }));
+    await screen.findByText('Far 0');
+    const list = screen.getByTestId('track-list');
+    list.scrollTop = 760000;
+    refreshPending = true;
+    window.dispatchEvent(new CustomEvent('library:changed', { detail: { preserveScroll: true } }));
+    await waitFor(() => expect(finish).toBeTypeOf('function'));
+    list.scrollTop = 380000;
+    fireEvent.click(screen.getByRole('button', { name: 'mock-jump-middle' }));
+    finish(makePagedResult(far, { page: 101, total: 18709, hasMore: true }));
+    await screen.findByText('Middle 0');
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(screen.getByTestId('track-list')).toBe(list);
+    expect(list.scrollTop).toBe(380000);
   });
 
   it('keeps TrackList totalCount stable when appending the second song page', async () => {

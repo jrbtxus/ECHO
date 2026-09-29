@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, WheelEvent } from 'react';
 import { Gauge, RotateCcw } from 'lucide-react';
+import { isUltraLightRendererRestore } from '../../../shared/types/ultraLightMode';
+import { hasResidentAudioPlayback } from '../../utils/audioControlHydration';
 import type { AudioStatus, PlaybackSpeedMode } from '../../../shared/types/audio';
 import { translateFallback, useOptionalI18n } from '../../i18n/I18nProvider';
 
@@ -171,6 +173,8 @@ export const PlayerSpeedControl = ({
   }, [clearPendingCommit, status]);
 
   useEffect(() => {
+    // The native host is still playing; a restored control must only observe it.
+    if (isUltraLightRendererRestore(window.location.search)) return;
     const getSettings = window.echo?.app?.getSettings;
     const audio = window.echo?.audio;
 
@@ -183,6 +187,15 @@ export const PlayerSpeedControl = ({
     void getSettings()
       .then(async (settings) => {
         if (isCancelled || requestRevision !== interactionRevisionRef.current || isDraggingRef.current || pendingCommitRef.current) {
+          return;
+        }
+
+        const residentStatus = typeof audio.getStatus === 'function' ? await audio.getStatus() : null;
+        if (isCancelled || requestRevision !== interactionRevisionRef.current || isDraggingRef.current || pendingCommitRef.current) return;
+        if (residentStatus && hasResidentAudioPlayback(residentStatus)) {
+          setPlaybackRate(speedFromStatus(residentStatus));
+          setMode(modeFromStatus(residentStatus));
+          onStatusChange(residentStatus);
           return;
         }
 
@@ -247,6 +260,19 @@ export const PlayerSpeedControl = ({
       setPlaybackRate(safeRate);
       holdPendingCommit({ playbackRate: safeRate, mode });
 
+      // Persist the user's intent before touching the native host. A crashed
+      // daemon cannot acknowledge setOutput, but the reset must still survive
+      // the next daemon/app start instead of replaying the failing speed.
+      const setSettings = window.echo?.app?.setSettings;
+      if (typeof setSettings === 'function') {
+        try {
+          await setSettings({ playbackSpeed: safeRate });
+        } catch {
+          // Runtime speed updates remain usable when settings storage is
+          // temporarily unavailable.
+        }
+      }
+
       if (!audio) {
         onError('Desktop bridge unavailable');
         return;
@@ -254,10 +280,6 @@ export const PlayerSpeedControl = ({
 
       try {
         const nextStatus = await audio.setOutput({ playbackRate: safeRate, playbackSpeedMode: mode });
-        const setSettings = window.echo?.app?.setSettings;
-        if (typeof setSettings === 'function') {
-          void setSettings({ playbackSpeed: safeRate }).catch(() => undefined);
-        }
         const pending = pendingCommitRef.current;
         if (pending && speedsMatch(pending.playbackRate, safeRate) && pending.mode === mode) {
           holdCommittedSpeedGuard({ playbackRate: safeRate, mode }, staleCommit);

@@ -6,6 +6,15 @@ import { zipSync } from 'fflate';
 import { DownloadService } from './DownloadService';
 import { createDownloadAuthorizationToken, protectedMusicDownloadBlockedMessage } from './DownloadAuthorization';
 
+const downloadAvailability = vi.hoisted(() => ({ enabled: true }));
+vi.mock('../../shared/constants/downloadAvailability', () => ({
+  get musicDownloadsEnabled() { return downloadAvailability.enabled; },
+  musicDownloadsDisabledMessage: '歌曲下载功能已关闭',
+  assertMusicDownloadsEnabled: () => {
+    if (!downloadAvailability.enabled) throw new Error('歌曲下载功能已关闭');
+  },
+}));
+
 let playbackState: 'idle' | 'loading' | 'playing' | 'paused' | 'stopped' = 'idle';
 
 vi.mock('../audio/AudioSession', () => ({
@@ -81,6 +90,7 @@ const waitForJob = async (service: DownloadService, jobId: string): Promise<Retu
 };
 
 afterEach(() => {
+  downloadAvailability.enabled = true;
   vi.useRealTimers();
   playbackState = 'idle';
   for (const root of tempRoots.splice(0)) {
@@ -89,6 +99,25 @@ afterEach(() => {
 });
 
 describe('DownloadService', () => {
+  it('blocks general music jobs before any command or network request', () => {
+    downloadAvailability.enabled = false;
+    const commandRunner = vi.fn();
+    const fetchRunner = vi.fn();
+    const service = new DownloadService(commandRunner, () => null, {
+      loadJobs: () => ({ version: 1, jobs: [], jobOptions: {} }),
+      saveJobs: vi.fn(),
+      fetch: fetchRunner,
+    });
+
+    for (const url of ['https://youtube.com/watch?v=abc', 'https://bilibili.com/video/BV1', 'https://cdn.example/song.mp3']) {
+      expect(() => service.createUrlJob(url)).toThrow('歌曲下载功能已关闭');
+    }
+    expect(() => service.createUrlJob('https://osu.ppy.sh/beatmapsets/123', { directAudio: true })).toThrow('歌曲下载功能已关闭');
+    expect(service.getJobs()).toEqual([]);
+    expect(commandRunner).not.toHaveBeenCalled();
+    expect(fetchRunner).not.toHaveBeenCalled();
+  });
+
   it('checks the bundled yt-dlp path with --version', async () => {
     const ytDlpPath = makeToolPath();
     const commandRunner = vi.fn((_command: string, _args: string[]) => ({
@@ -183,6 +212,7 @@ describe('DownloadService', () => {
   });
 
   it('downloads an osu beatmapset archive from the official endpoint and extracts the mapped audio file', async () => {
+    downloadAvailability.enabled = false;
     const outputDirectory = makeTempRoot();
     const archiveBytes = makeOsuArchive('audio.mp3', [11, 22, 33]);
     const fetchRunner = vi.fn(async () => {
@@ -233,9 +263,57 @@ describe('DownloadService', () => {
           title: 'Song',
           artist: 'Artist',
           album: '',
+          comment: 'beatmap id: 5477400',
         }),
       }),
     );
+  });
+
+  it('downloads every distinct song from an osu pack while skipping redundant speed versions', async () => {
+    const outputDirectory = makeTempRoot();
+    const archiveBytes = zipSync({
+      'song-a.osu': new TextEncoder().encode(
+        '[General]\nAudioFilename: song-a.mp3\n\n[Metadata]\nTitle: Song A\nArtist: Artist A\nVersion: Original\nBeatmapID: 101\n\n[Events]\n0,0,"song-a.jpg",0,0\n',
+      ),
+      'song-b.osu': new TextEncoder().encode(
+        '[General]\nAudioFilename: song-b.mp3\n\n[Metadata]\nTitle: Song B\nArtist: Artist B\nVersion: Original\nBeatmapID: 201\n\n[Events]\n0,0,"song-b.jpg",0,0\n',
+      ),
+      'song-a-1.2x.osu': new TextEncoder().encode(
+        '[General]\nAudioFilename: song-a-1.2x.mp3\n\n[Metadata]\nTitle: Song A\nArtist: Artist A\nVersion: 1.2x\n\n[Events]\n0,0,"speed.jpg",0,0\n',
+      ),
+      'song-a.mp3': new Uint8Array([1, 2, 3]),
+      'song-b.mp3': new Uint8Array([4, 5, 6]),
+      'song-a-1.2x.mp3': new Uint8Array([7, 8, 9]),
+      'song-a.jpg': new Uint8Array([11, 12]),
+      'song-b.jpg': new Uint8Array([21, 22, 23]),
+      'speed.jpg': new Uint8Array([31, 32, 33, 34]),
+    });
+    let importedCount = 0;
+    const importAudioFile = vi.fn(async (_filePath: string, _options?: Record<string, unknown>) => ({ id: `osu-track-${++importedCount}` }));
+    const writeEmbeddedTrackTags = vi.fn(async () => undefined);
+    const service = new DownloadService(undefined, undefined, {
+      fetch: vi.fn(async () => new Response(responseBody(archiveBytes), {
+        status: 200,
+        headers: { 'content-type': 'application/x-osu-beatmap-archive' },
+      })) as unknown as typeof fetch,
+      getAccountCredentials: (provider) => ({ provider }),
+      importAudioFile,
+      writeEmbeddedTrackTags,
+    });
+    service.setSettings({ outputDirectory, importToLibrary: true });
+
+    const job = service.createUrlJob('https://osu.ppy.sh/beatmapsets/999', { importToLibrary: true });
+    const completedJob = await waitForJob(service, job.id);
+
+    expect(completedJob.status).toBe('completed');
+    expect(completedJob.title).toBe('Artist A - Song A (2 首，已跳过 1 个倍速版本)');
+    expect(importAudioFile).toHaveBeenCalledTimes(2);
+    expect(importAudioFile.mock.calls.map(([filePath]) => filePath)).toEqual([
+      expect.stringMatching(/Artist A - Song A\.mp3$/u),
+      expect.stringMatching(/Artist B - Song B\.mp3$/u),
+    ]);
+    expect(importAudioFile.mock.calls.map(([, options]) => options?.osuBeatmapId)).toEqual(['101', '201']);
+    expect(writeEmbeddedTrackTags).toHaveBeenCalledTimes(2);
   });
 
   it('uses the dedicated osu output directory for osu beatmap downloads', async () => {
@@ -305,6 +383,8 @@ describe('DownloadService', () => {
           album: '',
         }),
         osuImport: true,
+        osuBeatmapId: '5477400',
+        osuBeatmapsetId: '2492872',
       }),
     );
     expect(bindMvUrl).not.toHaveBeenCalled();
@@ -421,8 +501,58 @@ describe('DownloadService', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://dl.sayobot.cn/beatmaps/download/novideo/2492872');
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(completedJob.status).toBe('completed');
     expect([...readFileSync(completedJob.outputPath!)]).toEqual([8, 6, 4, 2]);
+  });
+
+  it('uses the osu mirror captured on the job even if global settings differ', async () => {
+    const outputDirectory = makeTempRoot();
+    const archiveBytes = makeOsuArchive('snapshot.mp3', [4, 3, 2, 1]);
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      new Response(responseBody(archiveBytes), {
+        status: 200,
+        headers: { 'content-type': 'application/x-osu-beatmap-archive' },
+      }),
+    );
+    const service = new DownloadService(undefined, undefined, {
+      fetch: fetchMock as unknown as typeof fetch,
+      getAccountCredentials: (provider) => ({ provider }),
+      writeEmbeddedTrackTags: vi.fn(async () => undefined),
+    });
+    service.setSettings({ outputDirectory, importToLibrary: false, osuDownloadMirror: 'catboy' });
+
+    const job = service.createUrlJob('https://osu.ppy.sh/beatmapsets/2492872', {
+      importToLibrary: false,
+      osuDownloadMirror: 'sayobot',
+    });
+    const completedJob = await waitForJob(service, job.id);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://dl.sayobot.cn/beatmaps/download/novideo/2492872');
+    expect(completedJob.status).toBe('completed');
+  });
+
+  it('clears and aborts active osu jobs', async () => {
+    const outputDirectory = makeTempRoot();
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      }),
+    );
+    const service = new DownloadService(undefined, undefined, {
+      fetch: fetchMock as unknown as typeof fetch,
+      getAccountCredentials: (provider) => ({ provider }),
+    });
+    service.setSettings({ outputDirectory, importToLibrary: false });
+
+    service.createUrlJob('https://osu.ppy.sh/beatmapsets/2492872', { importToLibrary: false });
+    const remainingJobs = service.clearJobs('osu');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(remainingJobs).toEqual([]);
+    expect(service.getJobs()).toEqual([]);
   });
 
   it('loads and saves download settings through the settings store', () => {
@@ -537,7 +667,7 @@ describe('DownloadService', () => {
 
   it('searches only the selected provider when requested', async () => {
     const ytDlpPath = makeToolPath();
-    const commandRunner = vi.fn((_command: string, args: string[]) => ({
+    const commandRunner = vi.fn((_command: string, _args: string[]) => ({
       promise: Promise.resolve({
         stdout: JSON.stringify({
           entries: [{ id: 'BV1ECHO', title: 'Bilibili Song', url: 'https://www.bilibili.com/video/BV1ECHO' }],
@@ -1431,7 +1561,8 @@ describe('DownloadService', () => {
     );
   });
 
-  it('restores unfinished direct audio jobs and resumes from the partial file', async () => {
+  it.each([true, false])('restores unfinished direct audio jobs with music downloads enabled=%s', async (enabled) => {
+    downloadAvailability.enabled = enabled;
     const outputDirectory = makeTempRoot();
     const outputPath = join(outputDirectory, 'Artist - Resume Song.mp3');
     writeFileSync(outputPath, Buffer.from([1, 2]));
@@ -1485,6 +1616,7 @@ describe('DownloadService', () => {
               outputDirectory,
               importToLibrary: false,
               bindMvAfterImport: false,
+              osuDownloadMirror: 'auto',
               requestHeaders: {},
               suggestedTitle: 'Resume Song',
               suggestedArtist: 'Artist',
@@ -1510,6 +1642,14 @@ describe('DownloadService', () => {
     );
 
     const completedJob = await waitForJob(service, 'job-resume');
+
+    if (!enabled) {
+      expect(completedJob).toMatchObject({ status: 'failed', error: '歌曲下载功能已关闭' });
+      expect(fetchRunner).not.toHaveBeenCalled();
+      expect([...readFileSync(outputPath)]).toEqual([1, 2]);
+      expect(saveJobs).toHaveBeenCalled();
+      return;
+    }
 
     expect(fetchRunner).toHaveBeenCalledWith(
       'https://cdn.example/resume.mp3',
@@ -2080,7 +2220,8 @@ describe('DownloadService', () => {
     const ytDlpPath = makeToolPath();
     const outputDirectory = makeTempRoot();
     const outputPath = join(outputDirectory, '鏡音リン - ねぇねぇねぇ.m4a');
-    const mojibakePath = join(outputDirectory, '鏡音リン - ������������.m4a');
+    const replacementCharacters = String.fromCharCode(0xfffd).repeat(12);
+    const mojibakePath = join(outputDirectory, `鏡音リン - ${replacementCharacters}.m4a`);
     const importAudioFile = vi.fn(async () => ({ id: 'track-unicode' }));
     const service = new DownloadService(
       () => ({

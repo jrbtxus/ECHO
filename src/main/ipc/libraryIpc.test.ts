@@ -13,6 +13,7 @@ import type {
   LibraryPlaylist,
 } from '../../shared/types/library';
 import type { RemoteBackgroundGlobalStatus, RemoteSource } from '../../shared/types/remoteSources';
+import { writeCoverCacheOwnershipMarker } from '../library/CoverCacheOwnership';
 
 const handlers: Record<string, (...args: unknown[]) => unknown> = {};
 const handleMock = vi.fn((channel: string, handler: (...args: unknown[]) => unknown) => {
@@ -387,6 +388,7 @@ const installLibraryService = () => {
     scanFolder: vi.fn(),
     getScanStatus: vi.fn(),
     cancelScan: vi.fn(),
+    getTracksAsync: vi.fn(() => Promise.resolve({ items: [], page: 1, pageSize: 50, total: 0, hasMore: false })),
     getTracks: vi.fn(() => ({ items: [], page: 1, pageSize: 50, total: 0, hasMore: false })),
     getTracksPlaybackSafe: vi.fn(() => Promise.resolve({ items: [], page: 1, pageSize: 50, total: 0, hasMore: false })),
     getLibraryQualityOverview: vi.fn(() => []),
@@ -518,6 +520,7 @@ const installLibraryService = () => {
       totalBytesToRemove: 0,
       generatedAt: '2026-05-20T00:00:00.000Z',
     })),
+    getAlbumsAsync: vi.fn(),
     getAlbums: vi.fn(),
     getAlbumsPlaybackSafe: vi.fn(),
     getAlbum: vi.fn(),
@@ -1271,7 +1274,7 @@ describe('library IPC', () => {
     const service = installLibraryService();
     const root = makeTempRoot();
     const coverPath = join(root, 'cover.png');
-    const coverImage = { isEmpty: () => false as false };
+    const coverImage = { isEmpty: () => false as const };
     writeFileSync(coverPath, 'cover');
     service.getTrack.mockReturnValue({ ...service.getTrack('track-1'), coverId: 'cover-1' });
     service.resolveCoverAsset.mockReturnValue({ filePath: coverPath, mimeType: 'image/png' });
@@ -1289,7 +1292,7 @@ describe('library IPC', () => {
     const service = installLibraryService();
     const root = makeTempRoot();
     const coverPath = join(root, 'album-original.png');
-    const coverImage = { isEmpty: () => false as false };
+    const coverImage = { isEmpty: () => false as const };
     writeFileSync(coverPath, 'cover');
     service.getAlbum.mockReturnValue({
       id: 'album-1',
@@ -1461,6 +1464,7 @@ describe('library IPC', () => {
     const historyResult = await handlers[IpcChannels.LibraryGetPlaybackHistory]!(null, {
       page: 1,
       pageSize: 20,
+      mediaType: 'local',
       sort: 'recent',
     });
     const summaryResult = await handlers[IpcChannels.LibraryGetPlaybackHistorySummary]!(null, {
@@ -1477,6 +1481,7 @@ describe('library IPC', () => {
     expect(service.getPlaybackHistoryPlaybackSafe).toHaveBeenCalledWith({
       page: 1,
       pageSize: 20,
+      mediaType: 'local',
       sort: 'recent',
     });
     expect(service.getPlaybackHistorySummary).not.toHaveBeenCalled();
@@ -1521,7 +1526,7 @@ describe('library IPC', () => {
     expect(service.refreshDuplicateTracksPlaybackSafe).toHaveBeenCalledWith('balanced');
     expect(service.getDuplicateHiddenCounts).toHaveBeenCalledWith(['track-1'], 'aggressive');
     expect(service.getDuplicateIndexSummary).toHaveBeenCalledWith('strict');
-    expect(service.getTracks).toHaveBeenCalledWith({
+    expect(service.getTracksAsync).toHaveBeenCalledWith({
       page: 1,
       pageSize: 50,
       hideDuplicates: true,
@@ -1702,11 +1707,11 @@ describe('library IPC', () => {
 
     await handlers[IpcChannels.LibraryGetTracks]!(null, { page: 1, pageSize: 50, sort: 'fileModifiedDesc', extra: true });
     await handlers[IpcChannels.LibraryGetTracks]!(null, { page: 1, pageSize: 50, sort: 'artistAlbum', extra: true });
-    await handlers[IpcChannels.LibraryGetAlbums]!(null, { page: 1, pageSize: 50, sort: 'fileModifiedAsc', extra: true });
+    await handlers[IpcChannels.LibraryGetAlbums]!(null, { page: 1, pageSize: 50, sort: 'fileModifiedAsc', excludeOsuAlbums: true, extra: true });
 
-    expect(service.getTracks).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'fileModifiedDesc' });
-    expect(service.getTracks).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'artistAlbum' });
-    expect(service.getAlbums).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'fileModifiedAsc' });
+    expect(service.getTracksAsync).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'fileModifiedDesc' });
+    expect(service.getTracksAsync).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'artistAlbum' });
+    expect(service.getAlbumsAsync).toHaveBeenCalledWith({ page: 1, pageSize: 50, sort: 'fileModifiedAsc', excludeOsuAlbums: true });
   });
 
   it('registers artist detail IPC handlers with normalized queries', async () => {
@@ -1891,6 +1896,7 @@ describe('library IPC', () => {
       writeFileSync(join(root, 'echo-settings.json'), '{}\n', 'utf8');
       writeFileSync(join(root, 'plugins', 'plugin-state.json'), '{}\n', 'utf8');
       writeFileSync(join(root, 'cover-cache', 'cover.webp'), 'cover', 'utf8');
+      await writeCoverCacheOwnershipMarker(externalCoverCache);
       writeFileSync(join(externalCoverCache, 'external-cover.webp'), 'cover', 'utf8');
       getLibraryServiceMock.mockReturnValue({
         ...installLibraryService(),
@@ -1923,6 +1929,36 @@ describe('library IPC', () => {
     }
   });
 
+  it('keeps an unowned external cache directory intact during factory reset', async () => {
+    vi.useFakeTimers();
+    try {
+      const root = makeTempRoot();
+      const externalCache = makeTempRoot();
+      const unrelatedFile = join(externalCache, 'unrelated.txt');
+      const { app } = await import('electron');
+      vi.mocked(app.getPath).mockImplementation((name: string) => (name === 'downloads' ? 'D:\\Downloads' : root));
+      writeFileSync(join(root, 'echo-settings.json'), '{}\n', 'utf8');
+      writeFileSync(unrelatedFile, 'keep', 'utf8');
+      getLibraryServiceMock.mockReturnValue({
+        ...installLibraryService(),
+        getCoverCacheDir: () => externalCache,
+      });
+
+      const result = await handlers[IpcChannels.LibraryDeleteAllUserData]!() as LibraryAllUserDataDeleteResult;
+
+      expect(result.failedPaths).toEqual([
+        {
+          path: externalCache,
+          error: 'Skipped external cover cache directory because it is not marked as owned by ECHO Next.',
+        },
+      ]);
+      expect(readFileSync(unrelatedFile, 'utf8')).toBe('keep');
+      expect(result.relaunchScheduled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('restores a healthy snapshot through IPC and closes database users first', async () => {
     const root = makeTempRoot();
     const { app } = await import('electron');
@@ -1933,7 +1969,13 @@ describe('library IPC', () => {
     writeFileSync(join(root, 'echo-library.sqlite'), 'bad current database', 'utf8');
     const snapshotId = status.latestHealthySnapshot?.id ?? '';
 
-    const result = await handlers[IpcChannels.LibraryRestoreDatabaseSnapshot]!(null, snapshotId) as LibraryDatabaseRestoreResult;
+    let finishClosingReader!: () => void;
+    closeDatabaseUserMocks.library.mockImplementationOnce(() => new Promise<void>((resolve) => { finishClosingReader = resolve; }));
+    const restoring = handlers[IpcChannels.LibraryRestoreDatabaseSnapshot]!(null, snapshotId) as Promise<LibraryDatabaseRestoreResult>;
+    await vi.waitFor(() => expect(closeDatabaseUserMocks.library).toHaveBeenCalledTimes(1));
+    expect(readFileSync(join(root, 'echo-library.sqlite'), 'utf8')).toBe('bad current database');
+    finishClosingReader();
+    const result = await restoring;
 
     expect(result.health.status).toBe('ok');
     expect(closeDatabaseUserMocks.lyrics).toHaveBeenCalledTimes(1);

@@ -602,6 +602,8 @@ export const analyzePixelBuffer = (
   };
 };
 
+let sampleCanvas: HTMLCanvasElement | null = null;
+
 const drawToSampleCanvas = (
   source: CanvasImageSource,
   sourceWidth: number,
@@ -611,34 +613,68 @@ const drawToSampleCanvas = (
     return null;
   }
 
-  const canvas = document.createElement('canvas');
+  const canvas = sampleCanvas ?? document.createElement('canvas');
+  if (!sampleCanvas) {
+    canvas.width = sampleCanvasSize;
+    canvas.height = sampleCanvasSize;
+    sampleCanvas = canvas;
+  }
   const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) {
     return null;
   }
 
-  canvas.width = sampleCanvasSize;
-  canvas.height = sampleCanvasSize;
-  context.clearRect(0, 0, sampleCanvasSize, sampleCanvasSize);
-  context.drawImage(source, 0, 0, sampleCanvasSize, sampleCanvasSize);
-  const imageData = context.getImageData(0, 0, sampleCanvasSize, sampleCanvasSize);
-  return analyzePixelBuffer(imageData.data, { width: sampleCanvasSize });
+  try {
+    context.clearRect(0, 0, sampleCanvasSize, sampleCanvasSize);
+    context.drawImage(source, 0, 0, sampleCanvasSize, sampleCanvasSize);
+    const imageData = context.getImageData(0, 0, sampleCanvasSize, sampleCanvasSize);
+    return analyzePixelBuffer(imageData.data, { width: sampleCanvasSize });
+  } catch (error) {
+    // A cross-origin video can taint a canvas. Never reuse that surface for
+    // subsequent local artwork, which must remain readable.
+    sampleCanvas = null;
+    canvas.width = 0;
+    canvas.height = 0;
+    throw error;
+  }
 };
 
-export const sampleImageUrl = async (url: string): Promise<ReadableColorSample | null> =>
+const readableColorSampleCacheLimit = 32;
+const readableColorSampleTimeoutMs = 15_000;
+const readableColorSampleCache = new Map<string, ReadableColorSample>();
+const readableColorSampleInFlight = new Map<string, Promise<ReadableColorSample | null>>();
+
+const rememberReadableColorSample = (url: string, sample: ReadableColorSample): void => {
+  readableColorSampleCache.delete(url);
+  readableColorSampleCache.set(url, sample);
+  while (readableColorSampleCache.size > readableColorSampleCacheLimit) {
+    const oldestUrl = readableColorSampleCache.keys().next().value;
+    if (typeof oldestUrl !== 'string') {
+      break;
+    }
+    readableColorSampleCache.delete(oldestUrl);
+  }
+};
+
+const sampleImageUrlUncached = async (url: string): Promise<ReadableColorSample | null> =>
   new Promise((resolve) => {
-    if (!url || typeof Image === 'undefined' || typeof document === 'undefined') {
+    if (typeof Image === 'undefined' || typeof document === 'undefined') {
       resolve(null);
       return;
     }
 
     const image = new Image();
     let settled = false;
+    const timeout = window.setTimeout(() => finish(null), readableColorSampleTimeoutMs);
     const finish = (sample: ReadableColorSample | null): void => {
       if (settled) {
         return;
       }
       settled = true;
+      window.clearTimeout(timeout);
+      image.onload = null;
+      image.onerror = null;
+      image.removeAttribute('src');
       resolve(sample);
     };
 
@@ -658,6 +694,7 @@ export const sampleImageUrl = async (url: string): Promise<ReadableColorSample |
 
     if (image.complete && image.naturalWidth > 0) {
       queueMicrotask(() => {
+        if (settled) return;
         try {
           finish(drawToSampleCanvas(image, image.naturalWidth, image.naturalHeight));
         } catch {
@@ -666,6 +703,48 @@ export const sampleImageUrl = async (url: string): Promise<ReadableColorSample |
       });
     }
   });
+
+export const sampleImageUrl = (url: string): Promise<ReadableColorSample | null> => {
+  const normalizedUrl = url.trim();
+  if (!normalizedUrl) {
+    return Promise.resolve(null);
+  }
+
+  const cached = readableColorSampleCache.get(normalizedUrl);
+  if (cached) {
+    rememberReadableColorSample(normalizedUrl, cached);
+    return Promise.resolve(cached);
+  }
+
+  const existingRequest = readableColorSampleInFlight.get(normalizedUrl);
+  if (existingRequest) {
+    return existingRequest;
+  }
+
+  const request = sampleImageUrlUncached(normalizedUrl)
+    .then((sample) => {
+      if (sample) {
+        rememberReadableColorSample(normalizedUrl, sample);
+      }
+      return sample;
+    })
+    .finally(() => {
+      if (readableColorSampleInFlight.get(normalizedUrl) === request) {
+        readableColorSampleInFlight.delete(normalizedUrl);
+      }
+    });
+  readableColorSampleInFlight.set(normalizedUrl, request);
+  return request;
+};
+
+export const clearReadableColorSampleCache = (): void => {
+  readableColorSampleCache.clear();
+  if (sampleCanvas) {
+    sampleCanvas.width = 0;
+    sampleCanvas.height = 0;
+    sampleCanvas = null;
+  }
+};
 
 export const sampleVideoElement = async (video: HTMLVideoElement): Promise<ReadableColorSample | null> => {
   if (typeof document === 'undefined' || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {

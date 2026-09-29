@@ -1,8 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { app } from 'electron';
+import { musicDownloadsEnabled } from '../../shared/constants/downloadAvailability';
 import { finalThemeUnlockVersion, proOnlyThemePresets } from '../../shared/constants/featureUnlocks';
-import { artistOnlineInfoSources, artistStreamingAlbumProviders, autoUpdateSources, currentUserNoticeVersion, defaultArtistOnlineInfoSources, defaultArtistStreamingAlbumsProvider, playerBarButtonIds } from '../../shared/types/appSettings';
+import { artistOnlineInfoSources, artistStreamingAlbumProviders, autoUpdateSources, defaultArtistOnlineInfoSources, defaultArtistStreamingAlbumsProvider, playerBarButtonIds } from '../../shared/types/appSettings';
 import { defaultSidebarHiddenRouteIds, defaultSidebarRouteOrder, normalizeSidebarHiddenRouteIds, normalizeSidebarRouteOrder } from '../../shared/types/sidebar';
 import type {
   ArtistOnlineInfoSource,
@@ -15,9 +16,12 @@ import type {
   AppThemePresetOverrides,
   AppThemeToneOverride,
   AppThemePreset,
+  AccessibilityPreferences,
   AppearancePreferences,
   AppVideoWallpaperPauseMode,
+  AppWallpaperFitMode,
   AppWallpaperMediaType,
+  AppWallpaperPositionState,
   AppSettings,
   AutoUpdateSource,
   AudioTransportFadeCurve,
@@ -40,6 +44,12 @@ import type { LyricsProviderId } from '../../shared/types/lyrics';
 import type { LibrarySort } from '../../shared/types/library';
 import type { MvSettings, NetworkMvProviderId } from '../../shared/types/mv';
 import type { HqPlayerDefaultPlaybackBackend, HqPlayerSettings } from '../../shared/types/hqplayer';
+import {
+  defaultPetScalePercent,
+  petScalePercentMax,
+  petScalePercentMin,
+  petWindowBaseSize,
+} from '../../shared/types/pet';
 import {
   createDefaultGlobalShortcuts,
   createDefaultLocalShortcuts,
@@ -100,7 +110,7 @@ const defaultLyricsProviderOrder: LyricsProviderId[] = ['local', 'lrclib', 'nete
 export const defaultNetworkProxyBypassRules = '<local>;localhost;127.0.0.1;::1;*.local;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*';
 export const defaultTidalClientId = 'vmtQLf79BHl9YgUT';
 const appMemoryVersion = 6;
-const locales: AppLocale[] = ['zh-CN', 'zh-TW', 'en-US', 'ja-JP'];
+const locales: AppLocale[] = ['zh-CN', 'zh-TW', 'en-US', 'ja-JP', 'ko-KR'];
 const fallbackLocale: AppLocale = 'zh-CN';
 const appThemeModes: AppThemeMode[] = ['light', 'dark', 'system', 'ambient'];
 const defaultAppearanceThemeScheduleDarkAt = '19:00';
@@ -213,13 +223,24 @@ const librarySorts: LibrarySort[] = [
   'default',
   'createdAsc',
   'createdDesc',
+  'yearAsc',
+  'yearDesc',
   'titleAsc',
   'titleDesc',
+  'audioSpecAsc',
+  'audioSpecDesc',
+  'bpmAsc',
+  'bpmDesc',
   'durationAsc',
   'durationDesc',
+  'fileModifiedAsc',
+  'fileModifiedDesc',
   'qualityAsc',
   'qualityDesc',
   'frequent',
+  'playCountAsc',
+  'playCountDesc',
+  'lastPlayed',
   'random',
   'title',
   'artist',
@@ -239,6 +260,14 @@ export const defaultAppearancePreferences: AppearancePreferences = {
   lineHeight: 1.35,
   textDepth: 62,
   albumCoverShape: 'rounded',
+};
+
+export const defaultAccessibilityPreferences: AccessibilityPreferences = {
+  reduceMotionEnabled: false,
+  highContrastEnabled: false,
+  uiScalePercent: 100,
+  alwaysShowFocusEnabled: false,
+  screenReaderAnnouncementsEnabled: false,
 };
 
 const defaultRememberedAudioOutput: RememberedAudioOutput = {
@@ -315,8 +344,8 @@ const normalizeDesktopLyricsBounds = (value: unknown): DesktopLyricsBounds | nul
   return {
     x: Math.round(clamp(x, -32000, 32000)),
     y: Math.round(clamp(y, -32000, 32000)),
-    width: Math.round(clamp(width, 360, 1600)),
-    height: Math.round(clamp(height, 84, 320)),
+    width: Math.round(clamp(width, 360, 1760)),
+    height: Math.round(clamp(height, 84, 640)),
   };
 };
 
@@ -359,6 +388,9 @@ export const normalizeSystemLocale = (value: unknown): AppLocale => {
   if (locale.startsWith('ja')) {
     return 'ja-JP';
   }
+  if (locale.startsWith('ko')) {
+    return 'ko-KR';
+  }
   if (locale.startsWith('en')) {
     return 'en-US';
   }
@@ -379,7 +411,6 @@ const getDefaultLocale = (): AppLocale => {
 export const defaultSettings: AppSettings = {
   appMemoryVersion,
   onboardingCompleted: false,
-  userNoticeAcceptedVersion: 0,
   locale: getDefaultLocale(),
   appearanceTheme: 'light',
   appearanceThemeScheduleEnabled: false,
@@ -397,17 +428,19 @@ export const defaultSettings: AppSettings = {
   appWindowAcrylicKeepWhenUnfocusedEnabled: false,
   appWindowAcrylicTransparencyPercent: defaultAppWindowAcrylicTransparencyPercent,
   appearancePreferences: { ...defaultAppearancePreferences },
+  accessibilityPreferences: { ...defaultAccessibilityPreferences },
   hiddenPlayerBarButtonIds: ['audioExport'],
+  playerBarCoverOpensMv: false,
   sidebarRouteOrder: [...defaultSidebarRouteOrder],
   sidebarHiddenRouteIds: [...defaultSidebarHiddenRouteIds],
   sidebarAutoHideEnabled: false,
   sidebarIconOnlyEnabled: false,
   settingsOptionalSectionsVisible: false,
-  featureCommentsHidden: false,
   trackContextMenuExtraActionsEnabled: false,
   touchOnScreenKeyboardEnabled: false,
   songsSort: 'default',
   rememberedAudioOutput: { ...defaultRememberedAudioOutput },
+  audioAutomaticOutputEnabled: false,
   hiddenAudioDeviceKeys: [],
   audioUseNativeOutput: false,
   audioUseMiniaudioOutput: false,
@@ -420,8 +453,8 @@ export const defaultSettings: AppSettings = {
   audioSdmTargetRate: 'dsd128',
   audioSdmQualityProfile: 'safe',
   audioSdmComputeBackend: 'cpu',
-  audioSdmOversamplingFilterProfile1x: 'poly-sinc-ext2-long',
-  audioSdmOversamplingFilterProfileNx: 'poly-sinc-ext2-hires-lp',
+  audioSdmOversamplingFilterProfile1x: 'sinc-long',
+  audioSdmOversamplingFilterProfileNx: 'poly-sinc-hb',
   audioExclusiveInstabilityFallbackEnabled: false,
   audioSoxrFallbackEnabled: true,
   audioEchoSrcMode: 'off',
@@ -446,13 +479,16 @@ export const defaultSettings: AppSettings = {
   artistImageFetchPaused: false,
   liveLibraryUpdatesEnabled: false,
   liveLibraryAutoHideDeletedEnabled: false,
+  lowSpecModeEnabled: false,
+  ultraLightOnMinimizeOrTrayEnabled: false,
+  ultraLightGpuDisabled: false,
   safeModeEnabled: false,
   launchAtLoginEnabled: false,
   fastStartupEnabled: false,
   hardwareAccelerationDisabled: false,
   lyricsMvGraphicsPressureGuardEnabled: false,
   sqliteBalancedDurabilityEnabled: false,
-  dataProtectionDisabled: false,
+  dataProtectionDisabled: true,
   autoUpdateEnabled: true,
   autoUpdateSource: 'official',
   autoUpdateCustomUrl: null,
@@ -460,6 +496,8 @@ export const defaultSettings: AppSettings = {
   suppressAccountExpiryNotices: true,
   notificationsDisabled: false,
   upcomingTrackNoticeEnabled: false,
+  preventSleepWhilePlaying: false,
+  autoPlayOnStartup: false,
   streamingFeatureEnabled: true,
   osuDownloaderFeatureEnabled: false,
   streamingPlaylistImportNoticeAccepted: false,
@@ -471,7 +509,7 @@ export const defaultSettings: AppSettings = {
   tidalRedirectUri: null,
   tidalCountryCode: 'US',
   downloadsFeatureKeyAccepted: false,
-  downloadsFeatureUnlocked: false,
+  downloadsFeatureUnlocked: musicDownloadsEnabled,
   streamingDownloadActionsEnabled: false,
   connectAutoStartReceiversEnabled: false,
   airPlayReceiverProtocol: 'airplay1',
@@ -495,8 +533,13 @@ export const defaultSettings: AppSettings = {
   appWallpaperBlurPx: 0,
   appWallpaperBrightnessPercent: 100,
   appWallpaperUiOpacityPercent: 100,
+  appWallpaperOpacityPercent: 100,
   appWallpaperVisualProtectionEnabled: true,
   appWallpaperUnifiedOpacityEnabled: false,
+  appWallpaperFitMode: 'fill',
+  appWallpaperPosition: null,
+  appPortraitWallpaperFitMode: 'fill',
+  appPortraitWallpaperPosition: null,
   nowPlayingCoverColorEnabled: false,
   appVideoWallpaperPauseMode: 'smart',
   networkProxyMode: 'off',
@@ -517,13 +560,13 @@ export const defaultSettings: AppSettings = {
   lyricsEnabledProviders: [...defaultLyricsProviderOrder],
   lyricsProviderOrder: [...defaultLyricsProviderOrder],
   lyricsProviderTimeoutMs: 4500,
-  lyricsTotalMatchTimeoutMs: 6000,
+  lyricsTotalMatchTimeoutMs: 4000,
   lyricsCoverAutoAcceptScore: 0.97,
   lyricsDeepSearchEnabled: true,
   lyricsAutoSearch: true,
   lyricsAutoApplyEnabled: true,
-  lyricsAutoAcceptScore: 0.5,
-  lyricsBackfillAutoAcceptScore: 0.45,
+  lyricsAutoAcceptScore: 0.78,
+  lyricsBackfillAutoAcceptScore: 0.78,
   lyricsRestartOnApplyEnabled: false,
   lyricsAutoSaveSidecarEnabled: false,
   lyricsDefaultOffsetMs: 0,
@@ -540,6 +583,8 @@ export const defaultSettings: AppSettings = {
   lyricsPlayerBarDrawerEnabled: true,
   lyricsPlayerBarDrawerAutoEnableForMv: true,
   lyricsPlayerBarDrawerAutoHideEnabled: false,
+  lyricsPlayerBarDrawerShortcutEnabled: false,
+  lyricsPlayerBarDrawerShortcutAccelerator: null,
   lyricsPlayerBarDrawerCompactOnIdleEnabled: false,
   lyricsPlayerBarDrawerOpacityPercent: 78,
   lyricsPlayerBarDrawerColorMode: 'default',
@@ -594,14 +639,17 @@ export const defaultSettings: AppSettings = {
   miniPlayerLocked: false,
   miniPlayerAutoHideMainWindow: true,
   miniPlayerBounds: null,
-  taskbarMiniPlayerEnabled: true,
+  petEnabled: false,
+  petBounds: null,
+  petScalePercent: defaultPetScalePercent,
+  taskbarMiniPlayerEnabled: false,
   mvEnabled: true,
   mvEnabledProviders: ['bilibili', 'youtube'],
   mvProviderOrder: ['bilibili', 'youtube'],
   mvAutoSearch: true,
   mvAutoPreload: true,
   mvAutoApplyThreshold: 0.7,
-  mvTitleOnlySearch: true,
+  mvTitleOnlySearch: false,
   mvPreferHighestViewCount: true,
   mvImmersiveBackground: true,
   mvImmersiveBackgroundAutoScale: true,
@@ -630,6 +678,7 @@ export const defaultSettings: AppSettings = {
   fixedVolumeEnabled: false,
   gaplessPlaybackEnabled: false,
   playbackShuffleAvoidRecentCount: 25,
+  mouseGestureTrackSwitchEnabled: false,
   audioTransportFadeEnabled: false,
   audioTransportFadeInMs: defaultAudioTransportFadeDurationMs,
   audioTransportFadeOutMs: defaultAudioTransportFadeDurationMs,
@@ -669,6 +718,15 @@ export const defaultSettings: AppSettings = {
   smtcLyricsEnabled: false,
   taskbarPlaybackControlsEnabled: true,
   obsBrowserSourceEnabled: false,
+  echoLinkBasicEnabled: false,
+  mqttIntegrationEnabled: false,
+  mqttBrokerUrl: 'mqtt://127.0.0.1:1883',
+  mqttUsername: null,
+  mqttClientId: null,
+  mqttDeviceId: null,
+  mqttTopicPrefix: 'echo',
+  mqttHomeAssistantDiscoveryEnabled: false,
+  mqttHomeAssistantDiscoveryPrefix: 'homeassistant',
   stageApiEnabled: false,
 };
 
@@ -1122,7 +1180,7 @@ const normalizeAudioExportFormat = (value: unknown): AudioExportFormat =>
   value === 'wav' || value === 'flac' || value === 'ogg' || value === 'mp3' ? value : defaultSettings.audioExportFormat ?? 'mp3';
 
 const normalizeAudioEchoSrcMode = (value: unknown): AudioEchoSrcMode =>
-  value === 'family2x' || value === 'family4x' || value === 'family8x' ? value : 'off';
+  value === 'compatibility48' || value === 'family2x' || value === 'family4x' || value === 'family8x' ? value : 'off';
 
 const normalizeAudioEchoSrcQualityProfile = (value: unknown): AudioEchoSrcQualityProfile =>
   value === 'balanced' || value === 'lowLatency' ? value : 'transparent';
@@ -1197,6 +1255,27 @@ const normalizeAppearancePreferences = (value: unknown): AppearancePreferences =
   };
 };
 
+const accessibilityUiScalePercents = [100, 115, 130, 150] as const;
+
+const normalizeAccessibilityPreferences = (value: unknown): AccessibilityPreferences => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ...defaultAccessibilityPreferences };
+  }
+
+  const input = value as Partial<AccessibilityPreferences>;
+  const uiScalePercent = accessibilityUiScalePercents.includes(input.uiScalePercent as typeof accessibilityUiScalePercents[number])
+    ? input.uiScalePercent as AccessibilityPreferences['uiScalePercent']
+    : defaultAccessibilityPreferences.uiScalePercent;
+
+  return {
+    reduceMotionEnabled: input.reduceMotionEnabled === true,
+    highContrastEnabled: input.highContrastEnabled === true,
+    uiScalePercent,
+    alwaysShowFocusEnabled: input.alwaysShowFocusEnabled === true,
+    screenReaderAnnouncementsEnabled: input.screenReaderAnnouncementsEnabled === true,
+  };
+};
+
 const playerBarButtonIdSet = new Set<PlayerBarButtonId>(playerBarButtonIds);
 const normalizeHiddenPlayerBarButtonIds = (value: unknown): PlayerBarButtonId[] => {
   if (!Array.isArray(value)) {
@@ -1222,7 +1301,7 @@ const normalizeRememberedAudioOutput = (value: unknown): RememberedAudioOutput =
 
   const input = value as Partial<RememberedAudioOutput>;
   const outputMode =
-    input.outputMode === 'shared' || input.outputMode === 'exclusive' || input.outputMode === 'system'
+    input.outputMode === 'shared' || input.outputMode === 'exclusive' || input.outputMode === 'asio' || input.outputMode === 'system'
       ? input.outputMode
       : defaultRememberedAudioOutput.outputMode;
   const sharedBackend =
@@ -1289,6 +1368,27 @@ const normalizeMiniPlayerBounds = (value: unknown): DesktopLyricsBounds | null =
     y: Math.round(clamp(y, -32000, 32000)),
     width: Math.round(clamp(width, 320, 388)),
     height: 74,
+  };
+};
+
+const normalizePetBounds = (value: unknown, size: number): DesktopLyricsBounds | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const input = value as Partial<DesktopLyricsBounds>;
+  const x = Number(input.x);
+  const y = Number(input.y);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  return {
+    x: Math.round(clamp(x, -32000, 32000)),
+    y: Math.round(clamp(y, -32000, 32000)),
+    width: size,
+    height: size,
   };
 };
 
@@ -1375,10 +1475,14 @@ const normalizeLyricsTextDirection = (value: unknown): AppSettings['lyricsTextDi
   value === 'vertical' || value === 'horizontal' ? value : defaultSettings.lyricsTextDirection ?? 'horizontal';
 
 const normalizeLyricsMiniPlayerColorMode = (value: unknown): LyricsMiniPlayerColorMode =>
-  value === 'custom' || value === 'cover' || value === 'default' ? value : defaultSettings.lyricsPlayerBarDrawerColorMode ?? 'default';
+  value === 'custom' || value === 'cover' || value === 'default' || value === 'light'
+    ? value
+    : defaultSettings.lyricsPlayerBarDrawerColorMode ?? 'default';
 
 const normalizeLyricsPageStyle = (value: unknown): LyricsPageStyle =>
-  value === 'roseVinyl' ? 'roseVinyl' : defaultSettings.lyricsPageStyle ?? 'default';
+  value === 'editorial' || value === 'roseVinyl'
+    ? value
+    : defaultSettings.lyricsPageStyle ?? 'default';
 
 const normalizeDesktopLyricsColorMode = (value: unknown, legacyColor: unknown): DesktopLyricsColorMode => {
   if (value === 'theme' || value === 'custom' || value === 'gradient') {
@@ -1460,7 +1564,7 @@ const normalizeAutoUpdateCustomUrl = (value: unknown): string | null => {
 
   try {
     const url = new URL(trimmed);
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    if (url.protocol !== 'https:') {
       return null;
     }
     return url.toString().replace(/\/+$/u, '');
@@ -1494,6 +1598,33 @@ const normalizeAppWallpaperMediaType = (filePath: string | null): AppWallpaperMe
 
 const normalizeAppVideoWallpaperPauseMode = (value: unknown): AppVideoWallpaperPauseMode =>
   value === 'minimized' || value === 'never' || value === 'smart' ? value : defaultSettings.appVideoWallpaperPauseMode ?? 'smart';
+
+const normalizeAppWallpaperFitMode = (value: unknown): AppWallpaperFitMode =>
+  value === 'fit' || value === 'fill' || value === 'stretch' || value === 'tile' || value === 'center'
+    ? value
+    : defaultSettings.appWallpaperFitMode ?? 'fill';
+
+const normalizeAppWallpaperPosition = (value: unknown): AppWallpaperPositionState | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const candidate = value as Partial<AppWallpaperPositionState>;
+  const { x, y, zoom, iw, ih } = candidate;
+  if (
+    !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(zoom) ||
+    !Number.isFinite(iw) || !Number.isFinite(ih) ||
+    (iw as number) <= 0 || (ih as number) <= 0 || (zoom as number) <= 0
+  ) {
+    return null;
+  }
+  return {
+    x: Math.max(-0.5, Math.min(1.5, Number(x))),
+    y: Math.max(-0.5, Math.min(1.5, Number(y))),
+    zoom: Math.max(0.1, Math.min(10, Number(zoom))),
+    iw: Math.round(Number(iw)),
+    ih: Math.round(Number(ih)),
+  };
+};
 
 const normalizeNetworkProxyUrl = (value: unknown): string | null => {
   if (typeof value !== 'string') {
@@ -1632,18 +1763,6 @@ export const normalizeChannelBalanceSettings = (value: unknown): ChannelBalanceS
   };
 };
 
-const normalizeUserNoticeAcceptedVersion = (settings: Partial<AppSettings>): number => {
-  if (settings.userNoticeAcceptedVersion === currentUserNoticeVersion) {
-    return currentUserNoticeVersion;
-  }
-
-  if (currentUserNoticeVersion === 1 && settings.onboardingCompleted === true) {
-    return currentUserNoticeVersion;
-  }
-
-  return 0;
-};
-
 export const normalizeSettings = (value: unknown, options: NormalizeSettingsOptions = {}): AppSettings => {
   if (!value || typeof value !== 'object') {
     return { ...defaultSettings };
@@ -1671,7 +1790,8 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
   const scanPerformanceMode =
     settings.scanPerformanceMode === 'low' ||
     settings.scanPerformanceMode === 'balanced' ||
-    settings.scanPerformanceMode === 'performance'
+    settings.scanPerformanceMode === 'performance' ||
+    settings.scanPerformanceMode === 'ultra'
       ? settings.scanPerformanceMode
       : defaultSettings.scanPerformanceMode;
   const remoteCoverLoadPerformanceMode = remoteCoverLoadPerformanceModes.includes(settings.remoteCoverLoadPerformanceMode as RemoteCoverLoadPerformanceMode)
@@ -1685,6 +1805,7 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
   const appWallpaperBlurPx = Number(settings.appWallpaperBlurPx);
   const appWallpaperBrightnessPercent = Number(settings.appWallpaperBrightnessPercent);
   const appWallpaperUiOpacityPercent = Number(settings.appWallpaperUiOpacityPercent);
+  const appWallpaperOpacityPercent = Number(settings.appWallpaperOpacityPercent);
   const appCustomWallpaperPath = normalizeAppWallpaperPath(settings.appCustomWallpaperPath);
   const appPortraitWallpaperPath = normalizeAppWallpaperPath(settings.appPortraitWallpaperPath);
   const appWallpaperMediaType = normalizeAppWallpaperMediaType(appCustomWallpaperPath);
@@ -1727,6 +1848,10 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
   const desktopLyricsSecondaryFontSizePx = Number(settings.desktopLyricsSecondaryFontSizePx);
   const desktopLyricsScalePercent = Number(settings.desktopLyricsScalePercent);
   const desktopLyricsOpacityPercent = Number(settings.desktopLyricsOpacityPercent);
+  const petScalePercent = Number(settings.petScalePercent);
+  const normalizedPetScalePercent = Number.isFinite(petScalePercent)
+    ? Math.round(clamp(petScalePercent, petScalePercentMin, petScalePercentMax))
+    : defaultPetScalePercent;
   const lyricsProviderTimeoutMs = Number(settings.lyricsProviderTimeoutMs);
   const lyricsTotalMatchTimeoutMs = Number(settings.lyricsTotalMatchTimeoutMs);
   const lyricsBackfillAutoAcceptScore = Number(settings.lyricsBackfillAutoAcceptScore);
@@ -1764,9 +1889,7 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
       delete appearanceThemePresetOverrides[preset];
     }
   }
-  const downloadsFeatureUnlocked = (options.downloadsFeatureUnlocked ?? settings.downloadsFeatureUnlocked) === true;
   const downloadsFeatureKeyAccepted = settings.downloadsFeatureKeyAccepted === true;
-  const effectiveDownloadsFeatureUnlocked = downloadsFeatureUnlocked && downloadsFeatureKeyAccepted;
   const audioUseMiniaudioOutput =
     settings.audioUseMiniaudioOutput === true ||
     settings.audioMiniaudioOutputExperimentalEnabled === true;
@@ -1775,7 +1898,6 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
   return {
     appMemoryVersion,
     onboardingCompleted: settings.onboardingCompleted !== false,
-    userNoticeAcceptedVersion: normalizeUserNoticeAcceptedVersion(settings),
     locale: normalizeLocale(settings.locale),
     appearanceTheme: normalizeAppearanceTheme(settings.appearanceTheme),
     appearanceThemeScheduleEnabled: settings.appearanceThemeScheduleEnabled === true,
@@ -1795,13 +1917,14 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
       ? clamp(Math.round(Number(settings.appWindowAcrylicTransparencyPercent)), 0, 100)
       : defaultAppWindowAcrylicTransparencyPercent,
     appearancePreferences: normalizeAppearancePreferences(settings.appearancePreferences),
+    accessibilityPreferences: normalizeAccessibilityPreferences(settings.accessibilityPreferences),
     hiddenPlayerBarButtonIds: normalizeHiddenPlayerBarButtonIds(settings.hiddenPlayerBarButtonIds),
+    playerBarCoverOpensMv: settings.playerBarCoverOpensMv === true,
     sidebarRouteOrder: normalizeSidebarRouteOrder(settings.sidebarRouteOrder),
     sidebarHiddenRouteIds: normalizeSidebarHiddenRouteIds(settings.sidebarHiddenRouteIds),
     sidebarAutoHideEnabled: settings.sidebarAutoHideEnabled === true,
     sidebarIconOnlyEnabled: settings.sidebarAutoHideEnabled === true ? false : settings.sidebarIconOnlyEnabled === true,
     settingsOptionalSectionsVisible: settings.settingsOptionalSectionsVisible === true,
-    featureCommentsHidden: settings.featureCommentsHidden === true,
     trackContextMenuExtraActionsEnabled: settings.trackContextMenuExtraActionsEnabled === true,
     touchOnScreenKeyboardEnabled: settings.touchOnScreenKeyboardEnabled === true,
     songsSort: normalizeSongsSort(settings.songsSort),
@@ -1809,20 +1932,24 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
       normalizeRememberedAudioOutput(settings.rememberedAudioOutput),
       sourceAppMemoryVersion,
     ),
+    audioAutomaticOutputEnabled: settings.audioAutomaticOutputEnabled === true,
     hiddenAudioDeviceKeys: normalizeHiddenAudioDeviceKeys(settings.hiddenAudioDeviceKeys),
     audioUseNativeOutput: audioUseMiniaudioOutput,
     audioUseMiniaudioOutput,
     audioUseLibavDecode,
     audioMiniaudioOutputExperimentalEnabled: audioUseMiniaudioOutput,
     audioNativeDirectLocalPlaybackEnabled: settings.audioNativeDirectLocalPlaybackEnabled === true,
-    audioDsdOutputMode: settings.audioDsdOutputMode === 'dop' ? 'dop' : 'pcm',
+    audioDsdOutputMode:
+      settings.audioDsdOutputMode === 'dop' || settings.audioDsdOutputMode === 'pcm'
+        ? settings.audioDsdOutputMode
+        : defaultSettings.audioDsdOutputMode,
     audioDsdAutoVolumeLockEnabled: settings.audioDsdAutoVolumeLockEnabled === true,
     audioSdmMode: normalizeAudioSdmMode(settings.audioSdmMode),
     audioSdmTargetRate: normalizeAudioSdmTargetRate(settings.audioSdmTargetRate),
     audioSdmQualityProfile: normalizeAudioSdmQualityProfile(settings.audioSdmQualityProfile),
     audioSdmComputeBackend: normalizeAudioSdmComputeBackend(settings.audioSdmComputeBackend),
-    audioSdmOversamplingFilterProfile1x: normalizeAudioEchoSrcFilterProfile(settings.audioSdmOversamplingFilterProfile1x, 'poly-sinc-ext2-long'),
-    audioSdmOversamplingFilterProfileNx: normalizeAudioEchoSrcFilterProfile(settings.audioSdmOversamplingFilterProfileNx, 'poly-sinc-ext2-hires-lp'),
+    audioSdmOversamplingFilterProfile1x: normalizeAudioEchoSrcFilterProfile(settings.audioSdmOversamplingFilterProfile1x, 'sinc-long'),
+    audioSdmOversamplingFilterProfileNx: normalizeAudioEchoSrcFilterProfile(settings.audioSdmOversamplingFilterProfileNx, 'poly-sinc-hb'),
     audioExclusiveInstabilityFallbackEnabled: settings.audioExclusiveInstabilityFallbackEnabled === true,
     audioSoxrFallbackEnabled: settings.audioSoxrFallbackEnabled !== false,
     audioEchoSrcMode: normalizeAudioEchoSrcMode(settings.audioEchoSrcMode),
@@ -1850,13 +1977,19 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     artistImageFetchPaused: settings.artistImageFetchPaused === true,
     liveLibraryUpdatesEnabled: settings.liveLibraryUpdatesEnabled === true,
     liveLibraryAutoHideDeletedEnabled: settings.liveLibraryAutoHideDeletedEnabled === true,
+    lowSpecModeEnabled: settings.lowSpecModeEnabled === true,
+    ultraLightOnMinimizeOrTrayEnabled: settings.ultraLightOnMinimizeOrTrayEnabled === true,
+    ultraLightGpuDisabled: settings.ultraLightGpuDisabled === true,
     safeModeEnabled: settings.safeModeEnabled === true,
     launchAtLoginEnabled: settings.launchAtLoginEnabled === true,
     fastStartupEnabled: settings.fastStartupEnabled === true,
     hardwareAccelerationDisabled: settings.hardwareAccelerationDisabled === true,
     lyricsMvGraphicsPressureGuardEnabled: settings.lyricsMvGraphicsPressureGuardEnabled === true,
     sqliteBalancedDurabilityEnabled: settings.sqliteBalancedDurabilityEnabled === true,
-    dataProtectionDisabled: settings.dataProtectionDisabled === true,
+    dataProtectionDisabled:
+      typeof settings.dataProtectionDisabled === 'boolean'
+        ? settings.dataProtectionDisabled
+        : true,
     autoUpdateEnabled: settings.autoUpdateEnabled !== false,
     autoUpdateSource: normalizeAutoUpdateSource(settings.autoUpdateSource),
     autoUpdateCustomUrl: normalizeAutoUpdateCustomUrl(settings.autoUpdateCustomUrl),
@@ -1864,6 +1997,8 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     suppressAccountExpiryNotices: settings.suppressAccountExpiryNotices !== false,
     notificationsDisabled: settings.notificationsDisabled === true,
     upcomingTrackNoticeEnabled: settings.upcomingTrackNoticeEnabled === true,
+    preventSleepWhilePlaying: settings.preventSleepWhilePlaying === true,
+    autoPlayOnStartup: settings.autoPlayOnStartup === true,
     streamingFeatureEnabled: settings.streamingFeatureEnabled !== false,
     osuDownloaderFeatureEnabled: settings.osuDownloaderFeatureEnabled === true,
     streamingPlaylistImportNoticeAccepted: settings.streamingPlaylistImportNoticeAccepted === true,
@@ -1875,8 +2010,8 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     tidalRedirectUri: normalizeSpotifyRedirectUri(settings.tidalRedirectUri),
     tidalCountryCode: normalizeTidalCountryCode(settings.tidalCountryCode) ?? defaultSettings.tidalCountryCode,
     downloadsFeatureKeyAccepted,
-    downloadsFeatureUnlocked: effectiveDownloadsFeatureUnlocked,
-    streamingDownloadActionsEnabled: effectiveDownloadsFeatureUnlocked && settings.streamingDownloadActionsEnabled === true,
+    downloadsFeatureUnlocked: musicDownloadsEnabled,
+    streamingDownloadActionsEnabled: musicDownloadsEnabled && settings.streamingDownloadActionsEnabled === true,
     connectAutoStartReceiversEnabled: settings.connectAutoStartReceiversEnabled === true,
     airPlayReceiverProtocol: normalizeAirPlayReceiverProtocol(settings.airPlayReceiverProtocol),
     hqPlayer: normalizeHqPlayerSettings(settings.hqPlayer),
@@ -1907,8 +2042,15 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     appWallpaperUiOpacityPercent: Number.isFinite(appWallpaperUiOpacityPercent)
       ? Math.round(clamp(appWallpaperUiOpacityPercent, 0, 100))
       : defaultSettings.appWallpaperUiOpacityPercent,
+    appWallpaperOpacityPercent: Number.isFinite(appWallpaperOpacityPercent)
+      ? Math.round(clamp(appWallpaperOpacityPercent, 0, 100))
+      : defaultSettings.appWallpaperOpacityPercent,
     appWallpaperVisualProtectionEnabled: settings.appWallpaperVisualProtectionEnabled !== false,
     appWallpaperUnifiedOpacityEnabled: settings.appWallpaperUnifiedOpacityEnabled === true,
+    appWallpaperFitMode: normalizeAppWallpaperFitMode(settings.appWallpaperFitMode),
+    appWallpaperPosition: normalizeAppWallpaperPosition(settings.appWallpaperPosition),
+    appPortraitWallpaperFitMode: normalizeAppWallpaperFitMode(settings.appPortraitWallpaperFitMode),
+    appPortraitWallpaperPosition: normalizeAppWallpaperPosition(settings.appPortraitWallpaperPosition),
     nowPlayingCoverColorEnabled: settings.nowPlayingCoverColorEnabled === true,
     appVideoWallpaperPauseMode: normalizeAppVideoWallpaperPauseMode(settings.appVideoWallpaperPauseMode),
     networkProxyMode,
@@ -1944,10 +2086,10 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     lyricsAutoSearch: settings.lyricsAutoSearch !== false,
     lyricsAutoApplyEnabled: settings.lyricsAutoApplyEnabled !== false,
     lyricsAutoAcceptScore: Number.isFinite(lyricsAutoAcceptScore)
-      ? clamp(lyricsAutoAcceptScore, 0.3, 1)
+      ? clamp(lyricsAutoAcceptScore, 0.78, 1)
       : defaultSettings.lyricsAutoAcceptScore,
     lyricsBackfillAutoAcceptScore: Number.isFinite(lyricsBackfillAutoAcceptScore)
-      ? clamp(lyricsBackfillAutoAcceptScore, 0.3, 0.95)
+      ? clamp(lyricsBackfillAutoAcceptScore, 0.78, 0.95)
       : defaultSettings.lyricsBackfillAutoAcceptScore,
     lyricsRestartOnApplyEnabled: settings.lyricsRestartOnApplyEnabled === true,
     lyricsAutoSaveSidecarEnabled: settings.lyricsAutoSaveSidecarEnabled === true,
@@ -1969,6 +2111,9 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     lyricsPlayerBarDrawerEnabled: settings.lyricsPlayerBarDrawerEnabled !== false,
     lyricsPlayerBarDrawerAutoEnableForMv: settings.lyricsPlayerBarDrawerAutoEnableForMv !== false,
     lyricsPlayerBarDrawerAutoHideEnabled: settings.lyricsPlayerBarDrawerAutoHideEnabled === true,
+    lyricsPlayerBarDrawerShortcutEnabled: settings.lyricsPlayerBarDrawerShortcutEnabled === true,
+    lyricsPlayerBarDrawerShortcutAccelerator:
+      validateGlobalShortcutAccelerator(settings.lyricsPlayerBarDrawerShortcutAccelerator).accelerator,
     lyricsPlayerBarDrawerCompactOnIdleEnabled: settings.lyricsPlayerBarDrawerCompactOnIdleEnabled === true,
     lyricsPlayerBarDrawerOpacityPercent: Number.isFinite(lyricsPlayerBarDrawerOpacityPercent)
       ? Math.round(clamp(lyricsPlayerBarDrawerOpacityPercent, 20, 100))
@@ -2055,7 +2200,13 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     miniPlayerLocked: false,
     miniPlayerAutoHideMainWindow: settings.miniPlayerAutoHideMainWindow !== false,
     miniPlayerBounds: normalizeMiniPlayerBounds(settings.miniPlayerBounds),
-    taskbarMiniPlayerEnabled: settings.taskbarMiniPlayerEnabled !== false,
+    petEnabled: settings.petEnabled === true,
+    petBounds: normalizePetBounds(
+      settings.petBounds,
+      Math.round(petWindowBaseSize * normalizedPetScalePercent / 100),
+    ),
+    petScalePercent: normalizedPetScalePercent,
+    taskbarMiniPlayerEnabled: settings.taskbarMiniPlayerEnabled === true,
     mvEnabled: settings.mvEnabled !== false,
     mvEnabledProviders: normalizeMvProviderList(settings.mvEnabledProviders, defaultSettings.mvEnabledProviders),
     mvProviderOrder: [
@@ -2067,7 +2218,7 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     mvAutoApplyThreshold: Number.isFinite(mvAutoApplyThreshold)
       ? clamp(mvAutoApplyThreshold, 0.3, 1)
       : defaultSettings.mvAutoApplyThreshold,
-    mvTitleOnlySearch: settings.mvTitleOnlySearch !== false,
+    mvTitleOnlySearch: settings.mvTitleOnlySearch === true,
     mvPreferHighestViewCount: settings.mvPreferHighestViewCount !== false,
     mvImmersiveBackground: settings.mvImmersiveBackground !== false,
     mvImmersiveBackgroundAutoScale: settings.mvImmersiveBackgroundAutoScale !== false,
@@ -2110,6 +2261,7 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
     playbackShuffleAvoidRecentCount: Number.isFinite(Number(settings.playbackShuffleAvoidRecentCount))
       ? Math.round(clamp(Number(settings.playbackShuffleAvoidRecentCount), 0, 200))
       : defaultSettings.playbackShuffleAvoidRecentCount,
+    mouseGestureTrackSwitchEnabled: settings.mouseGestureTrackSwitchEnabled === true,
     audioTransportFadeEnabled: settings.audioTransportFadeEnabled === true,
     audioTransportFadeInMs: normalizeAudioTransportFadeDurationMs(settings.audioTransportFadeInMs),
     audioTransportFadeOutMs: normalizeAudioTransportFadeDurationMs(settings.audioTransportFadeOutMs),
@@ -2165,6 +2317,32 @@ export const normalizeSettings = (value: unknown, options: NormalizeSettingsOpti
         ? defaultSettings.taskbarPlaybackControlsEnabled
         : settings.taskbarPlaybackControlsEnabled === true,
     obsBrowserSourceEnabled: settings.obsBrowserSourceEnabled === true,
+    echoLinkBasicEnabled: settings.echoLinkBasicEnabled === true,
+    mqttIntegrationEnabled: settings.mqttIntegrationEnabled === true,
+    mqttBrokerUrl:
+      typeof settings.mqttBrokerUrl === 'string' && settings.mqttBrokerUrl.trim().length > 0
+        ? settings.mqttBrokerUrl.trim().slice(0, 512)
+        : defaultSettings.mqttBrokerUrl,
+    mqttUsername: normalizeOptionalText(settings.mqttUsername)?.slice(0, 128) ?? null,
+    mqttClientId: normalizeOptionalText(settings.mqttClientId)?.slice(0, 128) ?? null,
+    mqttDeviceId:
+      typeof settings.mqttDeviceId === 'string' &&
+      /^[A-Za-z0-9_-]{3,64}$/u.test(settings.mqttDeviceId)
+        ? settings.mqttDeviceId
+        : null,
+    mqttTopicPrefix:
+      typeof settings.mqttTopicPrefix === 'string' &&
+      /^(?!\/)(?!.*\/\/)[A-Za-z0-9_/-]{1,128}(?<!\/)$/u.test(settings.mqttTopicPrefix.trim())
+        ? settings.mqttTopicPrefix.trim()
+        : defaultSettings.mqttTopicPrefix,
+    mqttHomeAssistantDiscoveryEnabled: settings.mqttHomeAssistantDiscoveryEnabled === true,
+    mqttHomeAssistantDiscoveryPrefix:
+      typeof settings.mqttHomeAssistantDiscoveryPrefix === 'string' &&
+      /^(?!\/)(?!.*\/\/)[A-Za-z0-9_/-]{1,128}(?<!\/)$/u.test(
+        settings.mqttHomeAssistantDiscoveryPrefix.trim(),
+      )
+        ? settings.mqttHomeAssistantDiscoveryPrefix.trim()
+        : defaultSettings.mqttHomeAssistantDiscoveryPrefix,
     stageApiEnabled: settings.stageApiEnabled === true,
   };
 };
@@ -2209,10 +2387,6 @@ const shouldPersistFinalThemeRelock = (source: Partial<AppSettings>, normalized:
   );
 };
 
-const shouldPersistUserNoticeMigration = (source: Partial<AppSettings>, normalized: AppSettings): boolean =>
-  normalized.userNoticeAcceptedVersion === currentUserNoticeVersion &&
-  source.userNoticeAcceptedVersion !== currentUserNoticeVersion;
-
 const persistNormalizedSettings = (settings: AppSettings): void => {
   const settingsPath = getSettingsPath();
   mkdirSync(dirname(settingsPath), { recursive: true });
@@ -2244,7 +2418,7 @@ export const getAppSettings = (options: NormalizeSettingsOptions = {}): AppSetti
 
   const sourceSettings = cachedSettingsSource ?? defaultSettings;
   const settings = normalizeSettings(sourceSettings, options);
-  if (shouldPersistFinalThemeRelock(sourceSettings, settings) || shouldPersistUserNoticeMigration(sourceSettings, settings)) {
+  if (shouldPersistFinalThemeRelock(sourceSettings, settings)) {
     persistNormalizedSettings(settings);
     cachedSettingsSource = settings;
   }

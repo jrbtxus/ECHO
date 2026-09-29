@@ -277,12 +277,24 @@ const rebuild = (info) => {
 };
 
 try {
+  const info = await getTargetInfo();
+  const sqlitePackage = readJson(betterSqlitePackageJsonPath);
+  // Node-API releases ship their binding in prebuilds/ and deliberately opt
+  // out of node-gyp. electron-rebuild can succeed without producing the
+  // legacy build/Release file; do not apply ABI-specific caches to them.
+  if (sqlitePackage.gypfile === false && sqlitePackage.dependencies?.['node-addon-api']) {
+    if (!verifyNativeBinary(info)) {
+      throw new Error(`Packaged better-sqlite3 ${sqlitePackage.version} Node-API binding could not be loaded by ${info.runtime} ${info.runtimeVersion}. Reinstall dependencies for this platform.`);
+    }
+    console.log(`[native-abi] better-sqlite3 ${sqlitePackage.version} Node-API binding verified with ${info.runtime} ${info.runtimeVersion}; no ABI rebuild needed.`);
+    process.exit(0);
+  }
+
   run(process.execPath, [betterSqlitePatchScript], {
     stdio: 'inherit',
     encoding: undefined,
   });
 
-  const info = await getTargetInfo();
   const marker = readMarker();
 
   if (isCurrent(marker, info) && verifyNativeBinary(info)) {
@@ -310,5 +322,11 @@ try {
   console.log(`[native-abi] better-sqlite3 now matches ${info.runtime} ABI ${info.abi}.`);
 } catch (error) {
   console.error(`[native-abi] ${error instanceof Error ? error.message : String(error)}`);
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Could not find any Python installation/i.test(message)) {
+    console.error('[native-abi] Fix: run npm run doctor, then install Python 3.12+ and reopen PowerShell.');
+  } else if (/Could not find any Visual Studio installation/i.test(message)) {
+    console.error('[native-abi] Fix: install Visual Studio 2022 Build Tools with “Desktop development with C++” and the Windows SDK, then rerun npm install.');
+  }
   process.exit(1);
 }

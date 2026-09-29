@@ -9,6 +9,7 @@ import type {
   PlaybackStatsDashboard,
 } from '../../shared/types/library';
 import { I18nProvider } from '../i18n/I18nProvider';
+import { loadTranslations } from '../i18n/locales';
 import { HistoryPage, resetHistoryPageCacheForTest } from './HistoryPage';
 
 const playbackQueueMock = vi.hoisted(() => ({
@@ -239,6 +240,31 @@ afterEach(() => {
 });
 
 describe('HistoryPage', () => {
+  it('refreshes visible history after records change and removes the listener on unmount', async () => {
+    await loadTranslations('en-US');
+    let entries = [historyEntry('before-change')];
+    const getPlaybackHistory = vi.fn(() => Promise.resolve(historyPage(entries)));
+    const library = installLibraryMock({ getPlaybackHistory });
+    const { unmount } = renderHistoryPage();
+    await screen.findAllByText('History before-change');
+    await waitFor(() => expect(library.getPlaybackStatsDashboard).toHaveBeenCalledTimes(1));
+    const summaryCalls = vi.mocked(library.getPlaybackHistorySummary).mock.calls.length;
+
+    entries = [historyEntry('after-change', { playCount: 2 })];
+    fireEvent(window, new Event('playback-history:changed'));
+
+    await screen.findAllByText('History after-change');
+    expect(screen.queryByText('History before-change')).toBeNull();
+    expect(vi.mocked(library.getPlaybackHistorySummary).mock.calls.length).toBeGreaterThan(summaryCalls);
+    expect(getPlaybackHistory).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, sort: 'recent' }));
+
+    unmount();
+    getPlaybackHistory.mockClear();
+    fireEvent(window, new Event('playback-history:changed'));
+    await new Promise((resolve) => window.setTimeout(resolve, 30));
+    expect(getPlaybackHistory).not.toHaveBeenCalled();
+  });
+
   it('shows the stored history snapshot immediately on cold launch', () => {
     window.localStorage.setItem(
       'echo-next.history-page-cache.v1',
@@ -255,7 +281,7 @@ describe('HistoryPage', () => {
           total: 1,
         },
         savedAt: '2026-05-25T10:00:00.000Z',
-        version: 1,
+        version: 2,
       }),
     );
     installLibraryMock({
@@ -330,7 +356,7 @@ describe('HistoryPage', () => {
           total: 0,
         },
         savedAt: '2026-05-25T10:00:00.000Z',
-        version: 1,
+        version: 2,
       }),
     );
     installLibraryMock({
@@ -380,6 +406,72 @@ describe('HistoryPage', () => {
       pageSize: 8,
       sort: 'recent',
     }));
+  });
+
+  it('shows history from every source by default and only filters after an explicit source choice', async () => {
+    const getPlaybackHistory = vi.fn().mockResolvedValue(historyPage([historyEntry('all-sources')]));
+    const library = installLibraryMock({ getPlaybackHistory });
+
+    renderHistoryPage();
+
+    await screen.findAllByText('History all-sources');
+    expect(screen.getByRole('button', { name: 'All sources' }).className).toContain('active');
+    expect(library.getPlaybackHistory).toHaveBeenCalledWith(
+      expect.not.objectContaining({ mediaType: expect.anything() }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }));
+
+    await waitFor(() => expect(library.getPlaybackHistory).toHaveBeenCalledWith(
+      expect.objectContaining({ mediaType: 'streaming' }),
+    ));
+  });
+
+  it('uses the static large local cover for recently played artwork', async () => {
+    installLibraryMock({
+      getPlaybackHistory: vi.fn().mockResolvedValue(historyPage([
+        historyEntry('large-cover', {
+          coverId: 'cover large',
+          coverThumb: 'echo-cover://thumb/cover%20large',
+        }),
+      ])),
+    });
+
+    const { container } = renderHistoryPage();
+
+    await screen.findAllByText('History large-cover');
+    expect(container.querySelector('.history-recent-cover img')?.getAttribute('src')).toBe(
+      'echo-cover://large/cover%20large',
+    );
+  });
+
+  it('plays recent and ranked history entries on double click through the playback queue', async () => {
+    installLibraryMock({
+      getPlaybackHistory: vi.fn().mockResolvedValue(historyPage([historyEntry('double-click')])),
+    });
+
+    const { container } = renderHistoryPage();
+
+    await screen.findAllByText('History double-click');
+    const recentRow = container.querySelector('.history-recent-row');
+    const rankedRow = container.querySelector('.history-row');
+    expect(recentRow).toBeTruthy();
+    expect(rankedRow).toBeTruthy();
+
+    fireEvent.doubleClick(recentRow as HTMLElement);
+    await waitFor(() => expect(playbackQueueMock.playTrack).toHaveBeenCalledTimes(1));
+    expect(playbackQueueMock.playTrack).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: 'double-click', path: 'D:\\Music\\double-click.flac' }),
+      expect.objectContaining({
+        replaceQueueWith: [
+          expect.objectContaining({ id: 'double-click', path: 'D:\\Music\\double-click.flac' }),
+        ],
+        source: expect.objectContaining({ type: 'manual' }),
+      }),
+    );
+
+    fireEvent.doubleClick(rankedRow as HTMLElement);
+    await waitFor(() => expect(playbackQueueMock.playTrack).toHaveBeenCalledTimes(2));
   });
 
   it('restores the stats dashboard after the first history page renders', async () => {

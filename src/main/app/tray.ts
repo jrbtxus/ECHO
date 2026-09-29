@@ -4,6 +4,7 @@ import type { GlobalShortcutAction } from '../../shared/types/globalShortcuts';
 import { getMainWindow } from './windowManager';
 import { getSleepTimerService } from '../sleepTimer/SleepTimerService';
 import { createAppIconImage } from './appIcon';
+import { dispatchUltraLightModeAction, isUltraLightModeActive, restoreUltraLightMode } from './UltraLightModeService';
 
 let tray: Tray | null = null;
 let quitRequested = false;
@@ -18,6 +19,10 @@ const getCommandWindow = () => {
 };
 
 const showMainWindow = (): void => {
+  if (isUltraLightModeActive()) {
+    void restoreUltraLightMode();
+    return;
+  }
   const window = getCommandWindow();
 
   if (!window) {
@@ -41,6 +46,10 @@ const hideMainWindow = (): void => {
 };
 
 const sendPlaybackCommand = (action: GlobalShortcutAction): void => {
+  if (isUltraLightModeActive()) {
+    void dispatchUltraLightModeAction(action);
+    return;
+  }
   const window = getCommandWindow();
   if (!window) {
     return;
@@ -68,6 +77,18 @@ const showMiniPlayer = (): void => {
 const hideMiniPlayer = (): void => {
   void import('./miniPlayerWindow')
     .then(({ hideMiniPlayerWindow }) => hideMiniPlayerWindow())
+    .catch(() => undefined);
+};
+
+const showPet = (): void => {
+  void import('./petWindow')
+    .then(({ showPetWindow }) => showPetWindow())
+    .catch(() => undefined);
+};
+
+const hidePet = (): void => {
+  void import('./petWindow')
+    .then(({ hidePetWindow }) => hidePetWindow())
     .catch(() => undefined);
 };
 
@@ -107,7 +128,7 @@ const buildTrayMenu = (): Electron.Menu => {
   }
 
   return Menu.buildFromTemplate([
-    { label: '显示主界面', click: showMainWindow },
+    { label: isUltraLightModeActive() ? '恢复 ECHO 界面' : '显示主界面', click: showMainWindow },
     { label: '隐藏主界面', click: hideMainWindow },
     { type: 'separator' },
     { label: '播放 / 暂停', click: () => sendPlaybackCommand('playPause') },
@@ -117,6 +138,8 @@ const buildTrayMenu = (): Electron.Menu => {
     { type: 'separator' },
     { label: '打开迷你播放器', click: showMiniPlayer },
     { label: '隐藏迷你播放器', click: hideMiniPlayer },
+    { label: '显示 ECHO 宠物', click: showPet },
+    { label: '隐藏 ECHO 宠物', click: hidePet },
     { label: '音频设置', click: openAudioSettings },
     { type: 'separator' },
     ...sleepTimerItems,

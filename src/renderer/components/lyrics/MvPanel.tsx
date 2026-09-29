@@ -3,7 +3,7 @@ import type { CSSProperties, PointerEvent, WheelEvent as ReactWheelEvent } from 
 import { Clipboard, Film, Music2, X } from 'lucide-react';
 import type { AudioPlaybackState } from '../../../shared/types/audio';
 import type { LibraryTrack } from '../../../shared/types/library';
-import type { MvMatchCandidate, MvSettings, MvTrackSnapshotSearchRequest, TrackVideo } from '../../../shared/types/mv';
+import type { MvSettings, MvTrackSnapshotSearchRequest, TrackVideo } from '../../../shared/types/mv';
 import type { StreamingMvItem, StreamingProviderName } from '../../../shared/types/streaming';
 import { clampMvOffsetMs } from '../../../shared/constants/mvOffset';
 import { translateFallback, useOptionalI18n } from '../../i18n/I18nProvider';
@@ -56,7 +56,7 @@ const fallbackMvSettings: MvSettings = {
   autoSearch: true,
   autoPreload: true,
   autoApplyThreshold: 0.7,
-  titleOnlySearch: true,
+  titleOnlySearch: false,
   preferHighestViewCount: true,
   immersiveBackground: true,
   immersiveBackgroundAutoScale: true,
@@ -192,10 +192,6 @@ const isReceiverTrackId = (value: string | null | undefined): value is string =>
   Boolean(value?.startsWith('dlna-receiver:') || value?.startsWith('airplay-receiver:'));
 const shouldUseSnapshotMvSearch = (track: LibraryTrack | null | undefined, trackId: string | null | undefined): boolean =>
   Boolean(isReceiverTrackId(trackId) || track?.isTemporary || track?.mediaType === 'remote' || track?.mediaType === 'streaming');
-const rankedMvCandidates = (candidates: MvMatchCandidate[]): MvMatchCandidate[] => [
-  ...candidates.filter((entry) => entry.playableInApp),
-  ...candidates.filter((entry) => !entry.playableInApp),
-];
 const isPlayableTrackVideo = (video: TrackVideo | null | undefined): video is TrackVideo =>
   Boolean(video?.playableInApp && video.mediaUrl);
 const shouldAutoSearchForTrack = (
@@ -208,13 +204,15 @@ const shouldAutoSearchForTrack = (
     return false;
   }
 
-  const autoSearchEnabled = settings.autoSearch !== false;
-  const autoPreloadEnabled = settings.autoPreload !== false;
-  if (!autoSearchEnabled && !autoPreloadEnabled) {
+  if (settings.autoSearch === false) {
     return false;
   }
 
-  return isAudioPlaying || shouldUseSnapshotMvSearch(currentTrack, trackId);
+  return (
+    isAudioPlaying ||
+    isReceiverTrackId(trackId) ||
+    (settings.autoPreload !== false && shouldUseSnapshotMvSearch(currentTrack, trackId))
+  );
 };
 const mvSettingsKeys = [
   'enabled',
@@ -245,6 +243,7 @@ const mvReloadSettingsKeys = [
   'enabled',
   'autoSearch',
   'autoPreload',
+  'autoApplyThreshold',
   'titleOnlySearch',
   'preferHighestViewCount',
   'enabledProviders',
@@ -692,7 +691,6 @@ const snapshotSearchRequestForTrack = ({
     durationSeconds: currentTrack?.duration && currentTrack.duration > 0 ? currentTrack.duration : audioClock.durationSeconds,
     coverThumb: currentTrack?.coverThumb ?? coverUrl,
     mediaType: currentTrack?.mediaType ?? fallbackMediaType,
-    query: [searchTitle, searchArtist].filter(Boolean).join(' '),
   };
 };
 
@@ -802,6 +800,7 @@ export const MvPanel = ({
   const t = useOptionalI18n()?.t ?? translateFallback;
   const [selectedVideo, setSelectedVideo] = useState<TrackVideo | null>(null);
   const [settings, setSettings] = useState<MvSettings>(fallbackMvSettings);
+  const [selectionReloadRevision, setSelectionReloadRevision] = useState(0);
   const [hasLoadedSettings, setHasLoadedSettings] = useState(() => !window.echo?.mv);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1032,29 +1031,6 @@ export const MvPanel = ({
     }
   }, []);
 
-  const selectFirstPlayableCandidate = useCallback(
-    async (mvApi: NonNullable<NonNullable<Window['echo']>['mv']>, targetTrackId: string, candidates: MvMatchCandidate[]): Promise<TrackVideo | null> => {
-      if (!mvApi.selectVideo) {
-        return null;
-      }
-
-      for (const candidate of rankedMvCandidates(candidates)) {
-        try {
-          const selected = await mvApi.selectVideo(targetTrackId, candidate.id);
-          const resolved = await resolveNetworkVideo(selected);
-          if (isPlayableTrackVideo(resolved)) {
-            return resolved;
-          }
-        } catch {
-          // Try the next candidate; search results can include external-only videos.
-        }
-      }
-
-      return null;
-    },
-    [resolveNetworkVideo],
-  );
-
   const searchCandidatesForActiveTrack = useCallback(async (options: { forceSnapshot?: boolean } = {}): Promise<TrackVideo | null> => {
     const mvApi = window.echo?.mv;
     if (!trackId || !mvApi) {
@@ -1071,13 +1047,13 @@ export const MvPanel = ({
         title,
         trackId,
       });
-      const candidates = await mvApi.searchNetworkCandidatesForSnapshot(request);
-      return selectFirstPlayableCandidate(mvApi, request.trackId, candidates);
+      await mvApi.searchNetworkCandidatesForSnapshot({ ...request, autoSelect: true });
+      return mvApi.getSelected(request.trackId);
     }
 
     await mvApi.searchNetworkCandidates?.(trackId);
     return null;
-  }, [artist, coverUrl, currentTrack, selectFirstPlayableCandidate, title, trackId]);
+  }, [artist, coverUrl, currentTrack, title, trackId]);
 
   const getTemporaryPlayableForActiveTrack = useCallback(async (options: { forceSnapshot?: boolean } = {}): Promise<TrackVideo | null> => {
     const mvApi = window.echo?.mv;
@@ -1211,7 +1187,7 @@ export const MvPanel = ({
       if (directYouTubeUrl && mvApi?.bindUrl && shouldUseDirectYouTubeStreamingVideo(video, streamingTarget)) {
         video = await mvApi.bindUrl(effectiveTrackId, directYouTubeUrl);
       }
-      if (!video && mvApi?.searchNetworkCandidatesForSnapshot) {
+      if (!video && nextSettings.autoSearch !== false && mvApi?.searchNetworkCandidatesForSnapshot) {
         let streamingMvItems: StreamingMvItem[] = [];
         try {
           const streamingMv = await window.echo?.streaming?.getMv?.(streamingTarget);
@@ -1233,16 +1209,16 @@ export const MvPanel = ({
               ];
 
         for (const item of searchTargets) {
-          const candidates = await mvApi.searchNetworkCandidatesForSnapshot({
+          await mvApi.searchNetworkCandidatesForSnapshot({
             trackId: effectiveTrackId,
             title: item.title,
             artist: item.artist || artist,
             durationSeconds: item.duration ?? audioClockRef.current.durationSeconds,
             coverThumb: item.thumbnailUrl ?? coverUrl,
             mediaType: 'streaming',
-            query: [item.title, item.artist || artist].filter(Boolean).join(' '),
+            autoSelect: true,
           });
-          const selectedCandidate = await selectFirstPlayableCandidate(mvApi, effectiveTrackId, candidates);
+          const selectedCandidate = await mvApi.getSelected(effectiveTrackId);
           if (selectedCandidate) {
             video = selectedCandidate;
             break;
@@ -1266,7 +1242,6 @@ export const MvPanel = ({
                 durationSeconds: audioClockRef.current.durationSeconds,
                 coverThumb: coverUrl,
                 mediaType: 'streaming',
-                query: [title, artist].filter(Boolean).join(' '),
               });
               if (requestRef.current === requestId && temporaryVideo?.playableInApp && temporaryVideo.mediaUrl) {
                 setSelectedVideo(temporaryVideo);
@@ -1287,7 +1262,7 @@ export const MvPanel = ({
           setIsLoading(false);
         }
       });
-  }, [artist, coverUrl, liveStreamVideo, loadSettings, resolveNetworkVideo, selectFirstPlayableCandidate, streamingTarget, title, trackId]);
+  }, [artist, coverUrl, liveStreamVideo, loadSettings, resolveNetworkVideo, selectionReloadRevision, streamingTarget, title, trackId]);
 
   useEffect(() => {
     void loadSelected();
@@ -1317,6 +1292,7 @@ export const MvPanel = ({
   }, [loadSelected, trackId]);
 
   useEffect(() => {
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     const handleSettingsChanged = (event: Event): void => {
       const patch = event instanceof CustomEvent ? event.detail : null;
       if (patch && !isMvSettingsPatch(patch)) {
@@ -1329,22 +1305,38 @@ export const MvPanel = ({
         return;
       }
 
-      void loadSettings().then((nextSettings) => {
-        if (nextSettings.enabled === false) {
-          setSelectedVideo(null);
-          setVideoError(false);
-          return;
-        }
+      if (reloadTimer) clearTimeout(reloadTimer);
+      // A slider can emit many changes. Retry once using the final saved settings.
+      reloadTimer = setTimeout(() => {
+        preloadAttemptRef.current = null;
+        setUnavailableNoticeDismissed(false);
+        const requestId = ++requestRef.current;
+        void loadSettings().then((nextSettings) => {
+          if (requestRef.current !== requestId) return;
+          if (nextSettings.enabled === false) {
+            setSelectedVideo(null);
+            setVideoError(false);
+            setIsLoading(false);
+            return;
+          }
 
-        if (shouldReloadMvSelection(patch)) {
-          void loadSelected();
-        }
-      });
+          if (liveStreamVideo) {
+            setSelectedVideo(liveStreamVideo);
+          } else if (streamingTarget) {
+            setSelectionReloadRevision((revision) => revision + 1);
+          } else {
+            void loadSelected({ preserveCurrent: true });
+          }
+        });
+      }, 180);
     };
 
     window.addEventListener('settings:changed', handleSettingsChanged);
-    return () => window.removeEventListener('settings:changed', handleSettingsChanged);
-  }, [loadSelected, loadSettings]);
+    return () => {
+      window.removeEventListener('settings:changed', handleSettingsChanged);
+      if (reloadTimer) clearTimeout(reloadTimer);
+    };
+  }, [liveStreamVideo, loadSelected, loadSettings, streamingTarget]);
 
   const isMvEnabled = settings.enabled !== false;
   const selectedMvOffsetMs = clampMvOffsetMs(Number(selectedVideo?.offsetMs ?? 0));
@@ -1370,6 +1362,8 @@ export const MvPanel = ({
       !renderPressureReduced &&
       ((settings.immersiveBackground !== false && showVideo) || showYouTubeImmersiveBackground),
   );
+  const showForegroundVideo = showVideo && !showImmersiveBackground;
+  const showForegroundYouTubeEmbed = showYouTubeEmbed && !showImmersiveBackground;
   const isLyricsReadabilityEnhanced = settings.lyricsReadabilityEnhanced === true || smartReadableColorsEnabled;
   const hasVisibleMvSurface = showVideo || showYouTubeEmbed;
   const unavailableReason = hasVisibleMvSurface
@@ -1727,13 +1721,13 @@ export const MvPanel = ({
   }, [syncVideoElementToAudio]);
 
   useEffect(() => {
-    if (!showVideo || adaptiveStream || !videoRef.current) {
+    if (!showForegroundVideo || adaptiveStream || !videoRef.current) {
       return undefined;
     }
 
     const videoElement = videoRef.current;
     return () => releaseVideoElement(videoElement);
-  }, [adaptiveStream, showVideo, videoMediaUrl]);
+  }, [adaptiveStream, showForegroundVideo, videoMediaUrl]);
 
   useEffect(() => {
     if (!showImmersiveBackground || adaptiveStream || showYouTubeImmersiveBackground || !backgroundVideoRef.current) {
@@ -1754,7 +1748,7 @@ export const MvPanel = ({
   }, [isAudioPlaying, showVideo, syncVideoToAudio]);
 
   useEffect(() => {
-    if (!showVideo || !videoRef.current) {
+    if (!showForegroundVideo || !videoRef.current) {
       return;
     }
 
@@ -1767,7 +1761,7 @@ export const MvPanel = ({
     }
 
     videoRef.current.pause();
-  }, [applyVideoPlaybackRate, isAudioPlaying, showVideo, syncVideoToAudio, videoMediaUrl]);
+  }, [applyVideoPlaybackRate, isAudioPlaying, showForegroundVideo, syncVideoToAudio, videoMediaUrl]);
 
   useEffect(() => {
     if (!showImmersiveBackground || !backgroundVideoRef.current) {
@@ -1857,7 +1851,7 @@ export const MvPanel = ({
   ]);
 
   useEffect(() => {
-    if (!showVideo || !adaptiveStream || !videoMediaUrl || !videoRef.current) {
+    if (!showForegroundVideo || !adaptiveStream || !videoMediaUrl || !videoRef.current) {
       return undefined;
     }
 
@@ -1895,7 +1889,7 @@ export const MvPanel = ({
         releaseVideoElement(videoElement);
       }
     };
-  }, [adaptiveStream, applyVideoPlaybackRate, showVideo, syncVideoToAudio, videoMediaUrl]);
+  }, [adaptiveStream, applyVideoPlaybackRate, showForegroundVideo, syncVideoToAudio, videoMediaUrl]);
 
   useEffect(() => {
     if (!showImmersiveBackground || !adaptiveStream || !videoMediaUrl || !backgroundVideoRef.current) {
@@ -2067,6 +2061,7 @@ export const MvPanel = ({
             />
           ) : (
             <video
+              key={`background:${selectedVideo?.id ?? 'unknown'}:${videoMediaUrl ?? 'none'}`}
               ref={backgroundVideoRef}
               className="lyrics-mv-background-video"
               src={!adaptiveStream ? (videoMediaUrl ?? undefined) : undefined}
@@ -2074,6 +2069,7 @@ export const MvPanel = ({
               loop
               muted
               preload="metadata"
+              onError={() => setVideoError(true)}
               onLoadedMetadata={(event) => {
                 updateImmersiveVideoSize(event.currentTarget);
                 applyVideoPlaybackRate(event.currentTarget);
@@ -2084,6 +2080,12 @@ export const MvPanel = ({
                 }
 
                 event.currentTarget.pause();
+              }}
+              onSeeking={() => {
+                videoSeekingRef.current = true;
+              }}
+              onSeeked={() => {
+                videoSeekingRef.current = false;
               }}
               playsInline
             />
@@ -2101,9 +2103,10 @@ export const MvPanel = ({
       >
       <div className="lyrics-mv-ambient" style={coverUrl ? { backgroundImage: `url("${coverUrl}")` } : undefined} />
 
-      {showVideo ? (
+      {showForegroundVideo ? (
         <div className="lyrics-mv-player">
           <video
+            key={`foreground:${selectedVideo?.id ?? 'unknown'}:${videoMediaUrl ?? 'none'}`}
             ref={videoRef}
             className="lyrics-mv-video"
             src={!adaptiveStream ? (videoMediaUrl ?? undefined) : undefined}
@@ -2135,7 +2138,7 @@ export const MvPanel = ({
             playsInline
           />
         </div>
-      ) : showYouTubeEmbed ? (
+      ) : showForegroundYouTubeEmbed ? (
         <div className="lyrics-mv-player">
           <iframe
             className="lyrics-mv-video lyrics-mv-video--youtube"
@@ -2146,7 +2149,7 @@ export const MvPanel = ({
             title={selectedVideo?.title ?? 'YouTube MV'}
           />
         </div>
-      ) : (
+      ) : showImmersiveBackground ? null : (
         <CoverFallback
           artist={artist}
           coverUrls={uniqueCoverUrls(shouldSurfaceSelectedFallback ? selectedVideo?.thumbnailUrl : null, coverUrl)}
